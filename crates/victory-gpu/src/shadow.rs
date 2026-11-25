@@ -4305,9 +4305,6 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
-    // Bump before any copy is taken away: a second generation read on a
-    // recording thread must not miss the invalidation.
-    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
@@ -4322,10 +4319,20 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
+        let before = gone.len();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
+        }
+        if gone.len() != before {
+            // After the take, and under the lock `lookup` also holds. A
+            // recording thread caches a hit only if the generation is the
+            // same before and after its `lookup`, so the bump has to follow
+            // the change: bumped first, a thread could read the new
+            // generation, find the copy that is about to go, and cache it
+            // with nothing left to invalidate it.
+            BUFFER_GENERATION.fetch_add(1, Ordering::Release);
         }
     }
     let n = gone.len() as u64;
@@ -4398,9 +4405,7 @@ fn cached_lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if cached.is_some() && buffer_generation() == generation {
         return cached;
     }
-    let Some((shadow, registered)) = lookup(address, len, any) else {
-        return None;
-    };
+    let (shadow, registered) = lookup(address, len, any)?;
     if registered {
         FIND_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
