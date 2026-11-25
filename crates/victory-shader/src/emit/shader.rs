@@ -17,7 +17,8 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i`, [`SLOT_CONSTANT_BUFFER`]
+/// for a constant buffer view, 0 for anything else (none, a texture).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +27,13 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] dword of a heap slot holding a constant buffer
+/// view: a scalar load reads such a slot as a constant buffer, a buffer
+/// view (a stride) as raw bytes, and anything else as zeros. Read as a
+/// constant buffer, a slot holding a texture or nothing gave the host's
+/// D3D12 on Linux a descriptor with no buffer behind it, and the card
+/// faulted at address 0 (fork issue #698, item 4; runs of 2026-11-25).
+pub const SLOT_CONSTANT_BUFFER: u32 = u32::MAX;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

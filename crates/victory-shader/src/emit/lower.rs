@@ -25,6 +25,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "half_sum.rs"]
+mod half_sum;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 #[path = "guest_address.rs"]
@@ -2119,125 +2121,6 @@ impl<'a> Lower<'a> {
         let (fa, fb) = (wide(self, a), wide(self, b));
         let f = self.s.m.bin(c, Bin::Add, fa, fb);
         self.f16_nearest(f)
-    }
-
-    /// `WaveActiveSum` of 16-bit floats (`x`: each lane's term in its low half, +0 in the
-    /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
-    /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
-    /// in their order (lanes 2k and 2k+1, then pairs, ... then the wave's two halves;
-    /// [`super::wave::buddies`]). Each lane adds its partner's partial sum, read from the
-    /// lane whose number differs in one bit, step by step; two host waves of 32 then exchange
-    /// their halves' sums for the last addition. The high half of the result is lane 0's,
-    /// which no `v_add_f16` writes.
-    /// That needs every lane of a full wave there to be read: refused where not every lane
-    /// runs, in a thread group that does not fill its waves, and for each half-wave on its
-    /// own (half a sum is no sum).
-    fn half_sum(&mut self, x: V) -> Result<V, Why> {
-        const WHERE: Why = "a wave sum of 16-bit floats where not every lane runs";
-        let threads = self.s.threads.ok_or("a wave sum of 16-bit floats outside compute")?;
-        if threads.iter().product::<u32>() % 64 != 0 {
-            return Err("a wave sum of 16-bit floats in a wave that is not full");
-        }
-        if self.local {
-            return Err("a wave sum of 16-bit floats in a half-wave");
-        }
-        // two host waves of 32 that exchange, or one host wave of 64 lanes
-        let halves = match (&self.exchange, self.s.wave_size) {
-            (Some((_, false, _)), _) => true,
-            (None, Some(64)) if self.x.p.wave64 => false,
-            _ => return Err("a wave sum of 16-bit floats on these waves"),
-        };
-        let every = if halves {
-            self.all_lanes(self.cur_ir)
-        } else {
-            all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
-        };
-        if !every {
-            if halves {
-                need(self.cur_ir);
-                return Err(WHERE);
-            }
-            return Ok(self.half_sum_present(x));
-        }
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let mut sum = x;
-        for step in 0..if halves { 5 } else { 6 } {
-            let bit = self.s.m.i32(1 << step);
-            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
-            let theirs = self.read_lane(sum, partner);
-            sum = self.add_halves(sum, theirs);
-        }
-        let (high, low, zero) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(0));
-        let first = self.read_lane(x, zero);
-        let first = self.s.m.bin(c, Bin::And, first, high);
-        let sum = self.s.m.bin(c, Bin::And, sum, low);
-        let mine = self.s.m.bin(c, Bin::Or, first, sum);
-        if !halves {
-            return Ok(mine);
-        }
-        let (lo, hi) = self.exchange_halves(c, mine);
-        let c = self.cur;
-        let total = self.add_halves(lo, hi);
-        let total = self.s.m.bin(c, Bin::And, total, low);
-        let first = self.s.m.bin(c, Bin::And, lo, high);
-        Ok(self.s.m.bin(c, Bin::Or, first, total))
-    }
-
-    /// [`Self::half_sum`] in one host wave of 64 where some lanes have left (a thread past
-    /// the end of the data returns early): the console runs the sum in every lane, a lane
-    /// outside EXEC with +0, so after step k every lane of an aligned run of 2^k lanes holds
-    /// that run's partial sum, the lanes that left included. A lane reads its partner run's
-    /// sum from the first lane of that run that is here, and +0 where none is (every lane of
-    /// the run left, so its terms were all +0). Lane 0's high half likewise: 0 if it left.
-    fn half_sum_present(&mut self, x: V) -> V {
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        self.s.flags |= flags::WAVE_OPS;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let here = self.s.m.bool(true);
-        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
-        let (blo, bhi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
-        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let [zero, k31, k32] = [0, 31, 32].map(|k| self.s.m.i32(k));
-        // The lanes of the run of `size` lanes at `base` that are here, from bit 0.
-        let present = |l: &mut Self, base: V, size: u32| -> V {
-            let upper = l.s.m.cmp(c, pred::IUGE, base, k32);
-            let word = l.s.m.select(c, upper, bhi, blo);
-            let at = l.s.m.bin(c, Bin::And, base, k31);
-            let bits = l.s.m.bin(c, Bin::LShr, word, at);
-            if size >= 32 {
-                bits
-            } else {
-                let m = l.s.m.i32((1u32 << size) - 1);
-                l.s.m.bin(c, Bin::And, bits, m)
-            }
-        };
-        let mut sum = x;
-        for step in 0..6u32 {
-            let size = 1u32 << step;
-            let (bit, run) = (self.s.m.i32(size), self.s.m.i32(!(size - 1)));
-            let other = self.s.m.bin(c, Bin::Xor, lane, bit);
-            let base = self.s.m.bin(c, Bin::And, other, run);
-            let bits = present(self, base, size);
-            // FirstbitLo (dx.op 32): the run's first lane that is here
-            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[bits]);
-            let any = self.s.m.cmp(c, pred::NE, bits, zero);
-            let first = self.s.m.select(c, any, first, zero);
-            let from = self.s.m.bin(c, Bin::Add, base, first);
-            let theirs = self.read_lane(sum, from);
-            let theirs = self.s.m.select(c, any, theirs, zero);
-            sum = self.add_halves(sum, theirs);
-        }
-        let (high, low, one) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(1));
-        let lane0 = self.s.m.bin(c, Bin::And, blo, one);
-        let lane0 = self.s.m.cmp(c, pred::NE, lane0, zero);
-        let first = self.read_lane(x, zero);
-        let first = self.s.m.select(c, lane0, first, zero);
-        let first = self.s.m.bin(c, Bin::And, first, high);
-        let sum = self.s.m.bin(c, Bin::And, sum, low);
-        self.s.m.bin(c, Bin::Or, first, sum)
     }
 
     fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
@@ -5849,16 +5732,24 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table of strides by heap slot tells a buffer view (a
+        // stride), a constant buffer (`SLOT_CONSTANT_BUFFER`) and anything
+        // else (0) apart; only the load that fits the slot runs, and a slot
+        // that is neither reads zeros, as the console's hardware gives for
+        // a descriptor with no buffer behind it. (Read as a constant buffer,
+        // a texture's or an empty slot faulted the card at address 0 on the
+        // host's D3D12 on Linux: fork issue #698, item 4.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let constant = self.s.m.i32(super::shader::SLOT_CONSTANT_BUFFER);
+            let c = self.cur;
+            let some = self.s.m.cmp(c, pred::NE, stride, zero);
+            let not_cb = self.s.m.cmp(c, pred::NE, stride, constant);
+            let is_buffer = self.s.m.bin(c, Bin::And, some, not_cb);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5886,7 +5777,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, constant);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();

@@ -60,6 +60,7 @@ translation_inputs! {
     "emit/bitcode/opt.rs",
     "emit/container.rs",
     "emit/guest_address.rs",
+    "emit/half_sum.rs",
     "emit/intersect.rs",
     "emit/lower.rs",
     "emit/mod.rs",

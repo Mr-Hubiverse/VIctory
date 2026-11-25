@@ -752,6 +752,137 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     list.fill_scratch(address as *const u8, len)
 }
 
+/// Bytes of the zero-filled buffer bound where a root constant buffer or
+/// shader resource view has nothing to point at ([`null_root_view`]): the
+/// largest constant buffer.
+const NULL_ROOT_BYTES: u64 = 64 << 10;
+
+/// The buffer behind [`null_root_view`].
+struct NullRoot {
+    /// Held so the buffer lives as long as the process.
+    #[cfg_attr(not(test), allow(dead_code))]
+    buffer: ID3D12Resource,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for NullRoot {}
+// SAFETY: as above.
+unsafe impl Sync for NullRoot {}
+
+fn make_null_root(device: &ID3D12Device) -> Option<NullRoot> {
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: NULL_ROOT_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of an upload buffer; its bytes are written
+    // through its own mapping before anything reads them.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
+        let mut data = std::ptr::null_mut();
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        std::ptr::write_bytes(data.cast::<u8>(), 0, NULL_ROOT_BYTES as usize);
+        buffer.Unmap(0, None);
+        let gpu = buffer.GetGPUVirtualAddress();
+        Some(NullRoot { buffer, gpu })
+    }
+}
+
+/// A zero-filled buffer's address, for a root constant buffer or shader
+/// resource view that has nothing to point at (no host copy of the title's
+/// address, the title never set it, our directory not ready). Left unset,
+/// a root descriptor is undefined: the host's D3D12 on Linux passes it to
+/// the shader as a raw pointer, null or the previous draw's (possibly freed)
+/// buffer, and a read through it faults the card and loses the device (a
+/// scalar-cache read at 0xd000 in one run). Zeros are what such a read
+/// gives on the console's card for an unmapped page.
+fn null_root_view() -> Option<u64> {
+    static NULL: std::sync::OnceLock<Option<NullRoot>> = std::sync::OnceLock::new();
+    NULL.get_or_init(|| make_null_root(&crate::host::host()?.device))
+        .as_ref()
+        .map(|n| n.gpu)
+}
+
+/// Root views bound to [`null_root_view`] since the start.
+static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a root view bound to [`null_root_view`], logged at the first
+/// and then at every power of two.
+fn note_null_root(reason: &'static str, slot: u8, address: Option<u64>) {
+    let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            reason,
+            slot,
+            address = ?address.map(|a| format!("{a:#x}")),
+            count = n,
+            "a root view with nothing to point at: a zero-filled buffer is bound instead"
+        );
+    }
+}
+
+/// Sets a root constant buffer (`srv` false) or shader resource view.
+/// # Safety
+/// `l` is open and `gpu` lies in a buffer the list keeps alive.
+unsafe fn set_root_view(
+    l: &ID3D12GraphicsCommandList,
+    compute: bool,
+    srv: bool,
+    param: u32,
+    gpu: u64,
+) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        match (compute, srv) {
+            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+        }
+    }
+}
+
+/// Binds [`null_root_view`] at `param` and counts why.
+fn bind_null_root(
+    l: &ID3D12GraphicsCommandList,
+    compute: bool,
+    srv: bool,
+    param: u32,
+    slot: u8,
+    address: Option<u64>,
+    reason: &'static str,
+) {
+    note_null_root(reason, slot, address);
+    if let Some(gpu) = null_root_view() {
+        // SAFETY: an open list; the null buffer lives as long as the process.
+        unsafe { set_root_view(l, compute, srv, param, gpu) };
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1492,7 +1623,10 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set");
+                                bind_null_root(l, compute, true, param, slot, None, "no view heap to pick buffers from");
+                            }
                         }
                         continue;
                     }
@@ -1532,6 +1666,9 @@ impl State {
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
+                        if !tabled {
+                            bind_null_root(l, compute, srv, param, slot, None, "the title did not set the root view");
+                        }
                         continue;
                     };
                     // The shader adds the bytes a raw view begins early by.
@@ -1547,6 +1684,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        bind_null_root(l, compute, srv, param, slot, Some(address), "no host copy holds its address");
                         continue;
                     };
                     if biased {
@@ -4679,5 +4817,54 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+}
+
+#[cfg(test)]
+mod null_root_tests {
+    use super::*;
+
+    /// The default adapter's device (the card, through the host's D3D12).
+    fn device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+        device
+    }
+
+    #[test]
+    fn the_null_root_view_is_a_zeroed_constant_buffer_sized_buffer() {
+        let Some(device) = device() else {
+            eprintln!("no D3D12 device: skipped");
+            return;
+        };
+        let null = make_null_root(&device).expect("a null root buffer");
+        assert_ne!(null.gpu, 0);
+        assert_eq!(
+            null.gpu % 256,
+            0,
+            "a constant buffer view must be 256-byte aligned"
+        );
+        // SAFETY: our own buffer.
+        let desc = unsafe { null.buffer.GetDesc() };
+        assert!(
+            desc.Width >= NULL_ROOT_BYTES,
+            "covers the largest constant buffer"
+        );
+        let mut data = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped for reading its bytes.
+        unsafe { null.buffer.Map(0, None, Some(&mut data)).unwrap() };
+        // SAFETY: mapped, `Width` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), desc.Width as usize) };
+        assert!(bytes.iter().all(|&b| b == 0), "reads as zeros");
+    }
+
+    #[test]
+    fn null_roots_are_counted() {
+        let before = NULL_ROOTS.load(Ordering::Relaxed);
+        note_null_root("test", 3, Some(0x1234));
+        note_null_root("test", 3, None);
+        assert_eq!(NULL_ROOTS.load(Ordering::Relaxed), before + 2);
     }
 }
