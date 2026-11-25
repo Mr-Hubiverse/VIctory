@@ -605,6 +605,9 @@ impl Shader {
                 }
             }
         }
+        // One back edge per loop, as DXC's loops have (after the clean-up,
+        // which could otherwise fold a latch away again).
+        self.m.single_latches();
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {

@@ -492,6 +492,94 @@ impl Module {
         self.extract(block, r, 0)
     }
 
+    /// Gives every loop header that has more than one back edge a single
+    /// latch: a block of its own that the back edges branch to and that
+    /// branches to the header, the header's phis taking what the back edges
+    /// brought through phis of the latch. Returns how many latches it made.
+    ///
+    /// The console's loops `continue` from several blocks, each of which
+    /// became a back edge of its own. DXC never emits that, and
+    /// vkd3d-proton's DXIL to SPIR-V conversion (dxil-spirv) keeps one back
+    /// edge per header: in a program with a lane shuffle, which makes it
+    /// work out dominators before it untangles such loops, the edges it
+    /// dropped made a cycle it followed without end (the title's ray-traced
+    /// shadow programs; dxil-spirv#376): a stack overflow at any stack
+    /// size, and no pipeline.
+    pub(crate) fn single_latches(&mut self) -> usize {
+        let n = self.blocks.len();
+        if n == 0 {
+            return 0;
+        }
+        // Back edges: to a block on the depth-first path from the entry.
+        const NEW: u8 = 0;
+        const ON_PATH: u8 = 1;
+        const DONE: u8 = 2;
+        let mut state = vec![NEW; n];
+        let mut latches: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut stack = vec![(0usize, 0usize)];
+        state[0] = ON_PATH;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match successors(self.blocks[b].term).get(k) {
+                Some(&s) if state[s] == NEW => {
+                    state[s] = ON_PATH;
+                    stack.push((s, 0));
+                }
+                Some(&s) if state[s] == ON_PATH => {
+                    if !latches[s].contains(&b) {
+                        latches[s].push(b);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    state[b] = DONE;
+                    stack.pop();
+                }
+            }
+        }
+        let mut made = 0;
+        for (header, from) in latches.into_iter().enumerate() {
+            if from.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            self.blocks[latch].term = Some(Term::Br(header));
+            for &b in &from {
+                let to = |t: usize| if t == header { latch } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    other => other,
+                };
+            }
+            for i in self.blocks[header].phis.clone() {
+                let Op::Phi(incoming) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                let (back, mut rest): (Vec<_>, Vec<_>) =
+                    incoming.iter().copied().partition(|(_, b)| from.contains(b));
+                if back.is_empty() {
+                    continue;
+                }
+                let ty = self.insts[i as usize].ty;
+                let j = self.insts.len() as u32;
+                self.insts.push(Inst {
+                    ty,
+                    op: Op::Phi(back),
+                });
+                self.blocks[latch].phis.push(j);
+                if let Some(&tag) = self.tags.get(&i) {
+                    self.tags.insert(j, tag);
+                }
+                rest.push((V::Inst(j), latch));
+                self.insts[i as usize].op = Op::Phi(rest);
+            }
+            made += 1;
+        }
+        made
+    }
+
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
@@ -1194,6 +1282,64 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// A loop whose header two blocks branch back to gets one latch: the
+    /// header has one back edge, its phi takes the latch's phi, and the
+    /// latch's phi has what each back edge brought.
+    #[test]
+    fn a_loop_with_two_back_edges_gets_one_latch() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let i1 = m.int(1);
+        let [entry, head, left, right, exit] = [0; 5].map(|_| m.new_block());
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(head));
+        let x = m.phi(head, i32t);
+        let c = m.cmp(head, pred::EQ, x, zero);
+        m.terminate(head, Term::CondBr(c, left, right));
+        let a = m.bin(left, Bin::Add, x, one);
+        let d = m.cmp(left, pred::EQ, a, two);
+        m.terminate(left, Term::CondBr(d, exit, head));
+        let b = m.bin(right, Bin::Add, x, two);
+        m.terminate(right, Term::Br(head));
+        m.set_phi(x, vec![(zero, entry), (a, left), (b, right)]);
+        m.terminate(exit, Term::Ret);
+        let _ = i1;
+
+        assert_eq!(m.single_latches(), 1);
+        let latch = m.blocks.len() - 1;
+        assert!(matches!(m.blocks[latch].term, Some(Term::Br(h)) if h == head));
+        assert!(matches!(m.blocks[left].term, Some(Term::CondBr(_, e, l)) if e == exit && l == latch));
+        assert!(matches!(m.blocks[right].term, Some(Term::Br(l)) if l == latch));
+        let V::Inst(xi) = x else { unreachable!() };
+        let Op::Phi(head_in) = &m.insts[xi as usize].op else { unreachable!() };
+        assert_eq!(head_in.len(), 2);
+        assert_eq!(head_in[0], (zero, entry));
+        let (latch_phi, from) = head_in[1];
+        assert_eq!(from, latch);
+        let V::Inst(li) = latch_phi else { unreachable!() };
+        let Op::Phi(latch_in) = &m.insts[li as usize].op else { unreachable!() };
+        assert_eq!(latch_in, &vec![(a, left), (b, right)]);
+        // Once is enough; and the module still writes.
+        assert_eq!(m.single_latches(), 0);
+        assert!(!m.write().is_empty());
+    }
+
+    /// One back edge, nested loops with one each, or none: left alone.
+    #[test]
+    fn loops_with_one_back_edge_are_left_alone() {
+        let mut m = Module::default();
+        let [entry, outer, inner, tail, exit] = [0; 5].map(|_| m.new_block());
+        let c = m.bool(true);
+        m.terminate(entry, Term::Br(outer));
+        m.terminate(outer, Term::Br(inner));
+        m.terminate(inner, Term::CondBr(c, inner, tail));
+        m.terminate(tail, Term::CondBr(c, outer, exit));
+        m.terminate(exit, Term::Ret);
+        let blocks = m.blocks.len();
+        assert_eq!(m.single_latches(), 0);
+        assert_eq!(m.blocks.len(), blocks);
     }
 
     #[test]
