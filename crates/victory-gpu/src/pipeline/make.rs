@@ -417,7 +417,7 @@ const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
 /// waits and overlapping in-flight frames share this single ceiling, leaving
 /// 20 s of headroom for frame preparation, copies, RT work and presentation
 /// before [`TITLE_WATCHDOG`] fires.
-const WATCHDOG_WAIT_CEILING: Duration = Duration::from_secs(10);
+pub(crate) const WATCHDOG_WAIT_CEILING: Duration = Duration::from_secs(10);
 
 // Both kinds' windows, one after the other, stay under the watchdog.
 const _: () = assert!(2 * DEFAULT_WAIT_MS < TITLE_WATCHDOG.as_millis() as u64);
@@ -518,8 +518,24 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Non-blocking check of whether `p` has a host pipeline: queues `p` on the
+/// background workers at `REQUESTED` priority if not yet made, and returns
+/// `Some(true)` if compiled, `Some(false)` if refused/left out, or `None` if
+/// still being made.
+pub(crate) fn poll(p: &Arc<Pending>) -> Option<bool> {
+    if p.left_out.is_some() {
+        return Some(false);
+    }
+    if let Some(made) = p.made.get() {
+        return Some(made.is_some());
+    }
+    start(p, REQUESTED);
+    p.made.get().map(|made| made.is_some())
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
+#[allow(dead_code)]
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     // Its worker never came back: making it here would wait for that
     // worker for good (the one-time initialiser is still its).
@@ -1146,6 +1162,19 @@ mod tests {
         assert!(!named.contains("(this thread)"), "{named}");
         drop(making);
         assert_eq!(line(&being_made()), None);
+    }
+
+    #[test]
+    fn poll_queues_without_blocking_and_reports_completion() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let first = poll(&p);
+        assert!(matches!(first, None | Some(false)));
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while poll(&p).is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert_eq!(poll(&p), Some(false));
     }
 
     #[test]
