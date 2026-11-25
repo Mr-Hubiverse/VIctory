@@ -37,6 +37,8 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 cargo build --release -p victory
 ```
 
+[Cross-compiling from WSL](docs/build-windows-wsl.md)
+
 ## Play
 
 ```powershell
