@@ -1898,7 +1898,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 fn rehash_runs() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
+    (match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
         _ => 0,
@@ -1916,7 +1916,7 @@ fn rehash_runs() -> bool {
             }
             joined
         }
-    }
+    }) && !crate::drvwatch::tripped()
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the

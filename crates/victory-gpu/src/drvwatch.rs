@@ -47,7 +47,7 @@ fn seen() {
         n,
         "the graphics driver reported an error to the system's event log{}",
         if first {
-            ": from now on the paths under suspicion are off for this run (draw windows clamp each record again)"
+            ": from now on the paths under suspicion are off for this run (draw windows clamp each record again; single records are not gathered; no copy queues, rehash runs or upload-heap windows)"
         } else {
             ""
         }

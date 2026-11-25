@@ -360,7 +360,7 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// memory as before.
 fn window_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
 /// A window's buffer in a GPU upload heap and where it is mapped, if

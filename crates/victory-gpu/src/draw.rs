@@ -247,7 +247,7 @@ fn jump_windows() -> bool {
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+    (match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
         _ => 0,
@@ -266,7 +266,7 @@ fn gathers() -> bool {
             }
             on
         }
-    }
+    }) && !crate::drvwatch::tripped()
 }
 
 /// The records of a window opened at a remembered step ([`jump_windows`]):

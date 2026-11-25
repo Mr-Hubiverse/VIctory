@@ -511,7 +511,7 @@ impl Second {
 pub(crate) fn second() -> Option<&'static Second> {
     static SECOND: OnceLock<Option<Second>> = OnceLock::new();
     static CLOCKS: std::sync::Once = std::sync::Once::new();
-    if bits() == 0 {
+    if bits() == 0 || crate::drvwatch::tripped() {
         return None;
     }
     let second = SECOND

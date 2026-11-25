@@ -175,6 +175,26 @@ impl GraphicsState {
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
+    /// The blend description as the host takes it: blending is switched
+    /// off on integer targets. The title leaves `BlendEnable` on for a
+    /// UINT or SINT target (the blend result is never written there); the
+    /// console ignores the bit, the host refuses the whole pipeline
+    /// (`E_INVALIDARG`, as on the mesh pair f5e50eb2108c425b +
+    /// ce3f0432a08f1d35 rendering to R8_UINT).
+    fn blend_for_host(&self) -> D3D12_BLEND_DESC {
+        const INT: [i32; 21] = [
+            3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64,
+        ];
+        let mut blend = self.blend;
+        let int = |i: usize| INT.contains(&self.targets.RTFormats[i].0);
+        for (i, t) in blend.RenderTarget.iter_mut().enumerate() {
+            if (i as u32) < self.targets.NumRenderTargets && int(i) {
+                t.BlendEnable = false.into();
+            }
+        }
+        blend
+    }
+
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
@@ -592,7 +612,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -637,7 +657,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.blend_for_host(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -698,7 +718,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, state = %state, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -884,7 +904,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend_for_host()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -903,7 +923,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend_for_host()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
