@@ -1004,12 +1004,14 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let range = self.memory as usize..self.memory as usize + size;
+            let Some(mapped) = crate::watch::title_memory_reading_now(range.clone()) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            let range = self.memory as usize..self.memory as usize + size;
+            waited(2, || crate::watch::title_memory_reading_range(range.clone()))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

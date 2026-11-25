@@ -83,7 +83,7 @@ pub(crate) struct HeapDesc {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceDesc {
     dimension: u32,
     alignment: u64,
@@ -2599,6 +2599,64 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
         [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
         _ => 0,
     }
+}
+
+/// Holds a title resource and its committed memory or placement heap for a
+/// pending GPU-to-CPU transfer, including lists discarded before submission.
+#[cfg(windows)]
+pub(crate) struct ResourceRef(usize);
+
+#[cfg(windows)]
+impl ResourceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_ptr(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ResourceRef {
+    fn drop(&mut self) {
+        resource_release(self.as_ptr());
+    }
+}
+
+/// Resolve the current writer at this guest address, pinning its title resource
+/// while the descriptor or list is prepared. On the first address-only view
+/// create a resource; a synthetic writer must never displace a title object.
+#[cfg(windows)]
+pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<ResourceRef> {
+    // SAFETY: 56 bytes with the title resource description's layout.
+    let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if address == 0 || !(2..=4).contains(&desc.dimension) || desc.flags & 4 == 0 {
+        return None;
+    }
+    let find = || {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let target = *targets.get(&address)? as This;
+        if !object::try_add_ref(target) {
+            return Some(None);
+        }
+        let owner = ResourceRef(target as usize);
+        drop(targets);
+        let existing = resource(owner.as_ptr()).desc;
+        let same_shape = ResourceDesc {
+            alignment: desc.alignment,
+            flags: desc.flags,
+            ..existing
+        } == desc;
+        Some((same_shape && existing.flags & desc.flags == desc.flags).then_some(owner))
+    };
+    if let Some(owner) = find() {
+        return owner;
+    }
+    let texture = texture_at(address, words)?;
+    // Another title object may have arrived while making the synthetic one.
+    find().unwrap_or_else(|| Some(ResourceRef::new(texture)))
 }
 
 /// The resource [`texture_at`] made for a texture placed at `address` with

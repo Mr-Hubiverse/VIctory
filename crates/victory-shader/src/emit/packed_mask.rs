@@ -107,3 +107,111 @@ impl Lower<'_> {
         (when == Bool::FALSE && to == taken) || (when == Bool::TRUE && to == not_taken)
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::tests::{S_ENDPGM, lower_compute, root};
+    use crate::emit::host::{Dispatch, Host, Root, View};
+    use crate::emit::{HostShader, validator::Validator};
+    use crate::native::{HwStage, ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn a_packed_scalar_id_from_a_reused_mask_register_retains_all_bits() {
+        let words = [
+            0xBE84_0300,
+            0xBE85_0380, // s[4:5] = output table
+            0xF408_0402,
+            0xFA00_0000, // s[16:19] = output UAV
+            0xBE8A_037E, // s10 = initial exec
+            0xBE8C_3C0A, // s_and_saveexec_b32 s12, s10
+            0xBF88_0001, // s_cbranch_execz merge (never taken)
+            0xBE8A_0301, // s10 = packed scalar input
+            0xBEFE_030C, // merge: restore exec
+            0xD4C2_0006,
+            0x0002_0080, // v_cmp_eq_u32 s6, 0, v0
+            0xBE8E_3C06, // s_and_saveexec_b32 s14, s6
+            0xBF88_0007, // only lane zero uses the packed word
+            0x870B_FF0A,
+            0x001F_FFFF, // s11 = lower 21 bits
+            0x880D_FF0B,
+            0xDAE0_0000, // s13 = upper field | s11
+            0x7E02_020D, // v1 = s13
+            0xE070_1000,
+            0x8004_0100, // buffer_store_dword v1, v0, s[16:19]
+            0xBEFE_030E, // restore exec
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let output = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let lowered = lower_compute(&words, layout, vec![output], false, false).unwrap();
+        let mut shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            written_root_uavs: lowered.written_root_uavs,
+            writes_guest_memory: lowered.writes_guest_memory,
+            root_indexed_views: Vec::new(),
+        };
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else { return };
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+        };
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: feature query with the corresponding initialized structure.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&mut caps as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS1).cast(),
+                    size_of_val(&caps) as u32,
+                )
+                .unwrap()
+        };
+        if !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&32) {
+            eprintln!("packed ID execution needs a wave32 adapter");
+            return;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for value in [0, 0x0012_3456, 0xF123_FFFF] {
+            let mut data = vec![0; shader.user_data_dwords().max(1) as usize];
+            for param in &shader.user_data {
+                if param.root == RootType::Constants {
+                    data[param.index as usize] = value;
+                }
+            }
+            let result = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(result[0], [0xDAE0_0000 | (value & 0x001F_FFFF)]);
+        }
+    }
+}

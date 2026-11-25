@@ -24,6 +24,7 @@
 //! system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Mutex;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -954,40 +955,117 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-/// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
-
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+struct Mapping {
+    changing: Option<Range<usize>>,
+    readers: Vec<Range<usize>>,
 }
 
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+static MAPPING: Mutex<Mapping> = Mutex::new(Mapping {
+    changing: None,
+    readers: Vec::new(),
+});
+static WRITER: Mutex<()> = Mutex::new(());
+static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+const ALL_MEMORY: Range<usize> = 0..usize::MAX;
+
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start.max(b.start) < a.end.min(b.end)
+}
+
+impl Mapping {
+    fn changing(&self, range: &Range<usize>) -> bool {
+        self.changing.as_ref().is_some_and(|w| overlaps(w, range))
+    }
+
+    fn pin(&mut self, range: Range<usize>) -> Reading {
+        self.readers.push(range.clone());
+        Reading(range)
+    }
+}
+
+/// The only active change of physical mappings.
+pub struct Remapping {
+    _writer: std::sync::MutexGuard<'static, ()>,
+    range: Range<usize>,
+    previous: Vec<crate::inplace::PhysicalSpan>,
+}
+
+/// Protects a mapping change whose extent is unknown.
+pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(ALL_MEMORY)
+}
+
+/// Protects every address that can be unmapped during the operation,
+/// including whole old views that Windows temporarily removes.
+pub fn title_memory_remapping_range(range: Range<usize>) -> Remapping {
+    let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    state.changing = Some(range.clone());
+    drop(
+        MAPPING_CHANGED
+            .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    let previous = crate::inplace::physical_spans(&range);
+    Remapping {
+        _writer: writer,
+        range,
+        previous,
+    }
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        let current = crate::inplace::physical_spans(&self.range);
+        crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
+        MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
+        MAPPING_CHANGED.notify_all();
+    }
+}
+
+/// Keeps a direct read's virtual address range mapped.
+pub struct Reading(Range<usize>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        let i = state
+            .readers
+            .iter()
+            .position(|r| *r == self.0)
+            .expect("active mapping reader");
+        state.readers.swap_remove(i);
+        if state.changing(&self.0) {
+            MAPPING_CHANGED.notify_all();
+        }
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(ALL_MEMORY)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+/// Pins only the range the caller will read. Do not nest mapping guards.
+pub fn title_memory_reading_range(range: Range<usize>) -> Reading {
+    let state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    MAPPING_CHANGED
+        .wait_while(state, |s| s.changing(&range))
+        .unwrap_or_else(|e| e.into_inner())
+        .pin(range)
+}
+
+/// Pins a range immediately if available, for callers with a fallback.
+pub(crate) fn title_memory_reading_now(range: Range<usize>) -> Option<Reading> {
+    let mut state = match MAPPING.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    (!state.changing(&range)).then(|| state.pin(range))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it

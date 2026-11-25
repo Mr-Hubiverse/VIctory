@@ -1255,6 +1255,62 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn scalar_heap_addresses_follow_title_descriptor_creation_copies_and_reuse() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+
+        let Some(_) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut object = null;
+        let desc = HeapDesc { kind: 0, count: 6, flags: 1, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let title = heap(object);
+        let gpu = title.host().unwrap();
+        let slot = |index| title.handle(index).unwrap();
+
+        // The null-resource RTAS description captured from the Chapter 1 City heap.
+        let mut acceleration = [0, 11, 5768, 0, 1608386816, 13, 0, 0, 0, 0];
+        let tlas = u64::from(acceleration[4]) | u64::from(acceleration[5]) << 32;
+        create_srv(null, null, &acceleration, slot(1));
+        copy_simple(null, 1, slot(2), slot(1), 0);
+
+        // A placed typed buffer with FirstElement = 2 reads eight bytes in.
+        let backing = [0u64; 8];
+        let base = backing.as_ptr() as u64;
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 64;
+        let mut placed = [0; 16];
+        placed[0] = 41; // R32_FLOAT
+        placed[1] = 1; // BUFFER
+        placed[4] = 2;
+        placed[6] = 4;
+        placed[10] = base as u32;
+        placed[11] = (base >> 32) as u32;
+        create_placed_srv(null, &resource, &placed, slot(3));
+
+        let table = gpu.address_buffer(title).unwrap();
+        let contents = || unsafe {
+            // SAFETY: this read maps the eight u64 words allocated for the six-slot heap.
+            let mut data = std::ptr::null_mut();
+            table.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 64 }), Some(&mut data)).unwrap();
+            let words = data.cast::<[u64; 8]>().read_volatile();
+            table.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            words
+        };
+        assert_eq!(contents(), [6, 0, 0, tlas, tlas, base + 8, 0, 0]);
+        assert_eq!(&*gpu.acceleration_addresses(), &[tlas]);
+        acceleration[4] += 256;
+        create_srv(null, null, &acceleration, slot(1));
+        copy_simple(null, 1, slot(4), slot(3), 0);
+        copy_simple(null, 1, slot(3), slot(0), 0); // untagged, deferred source
+        create_srv(null, null, null.cast(), slot(2));
+        assert_eq!(contents(), [6, 0, 0, tlas + 256, 0, 0, base + 8, 0]);
+        assert_eq!(&*gpu.acceleration_addresses(), &[tlas + 256]);
+        assert_eq!(release(object), 0);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();

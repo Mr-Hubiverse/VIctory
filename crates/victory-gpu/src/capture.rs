@@ -324,6 +324,66 @@ fn dump_after_hashes() -> &'static [String] {
     })
 }
 
+/// `VICTORY_DUMP_INPUT=<compute hash>:s<table>+<dword offset>,...`.
+/// Capture one explicitly bound 2D SRV per named direct dispatch on listed frames.
+/// Use the same hash in VICTORY_DUMP_AFTER to capture outputs of that invocation.
+#[derive(Debug, PartialEq)]
+pub(crate) struct InputSelector {
+    pub hash: String,
+    pub table: u8,
+    pub dword: u32,
+}
+
+fn input_selector(value: &str) -> Option<InputSelector> {
+    let (hash, binding) = value.trim().split_once(":s")?;
+    let (table, dword) = binding.split_once('+')?;
+    if hash.len() != 16 || !hash.bytes().all(|v| v.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(InputSelector {
+        hash: hash.to_ascii_lowercase(),
+        table: table.parse().ok()?,
+        dword: dword.parse().ok()?,
+    })
+}
+
+pub(crate) fn input_selectors() -> &'static [InputSelector] {
+    static SELECTORS: std::sync::OnceLock<Vec<InputSelector>> = std::sync::OnceLock::new();
+    SELECTORS.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_INPUT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(input_selector)
+            .collect()
+    })
+}
+
+pub(crate) struct InputDump {
+    frame: u64,
+    selector: &'static InputSelector,
+    resource: usize,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
+pub(crate) fn read_input(
+    list: &crate::host::HostList,
+    frame: u64,
+    selector: &'static InputSelector,
+    resource: usize,
+) -> Option<InputDump> {
+    let host = crate::host::host()?;
+    let copy = crate::resource::host_copy(resource as crate::object::This)?;
+    // SAFETY: the Arc owns the live source. Only a single-slice 2D image is supported.
+    let desc = unsafe { copy.texture.GetDesc() };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 {
+        return None;
+    }
+    let (buffer, footprint) = list.read_bound_input(&host.device, &copy)?;
+    list.keep(&buffer);
+    Some(InputDump { frame, selector, resource, buffer, footprint })
+}
+
 /// The textures the unordered access views of the draw or dispatch being
 /// bound write, by host list: what [`dump_after`] saves besides render
 /// targets.
@@ -365,8 +425,17 @@ fn nth_after(seen: &mut Vec<(u64, String, u32)>, frame: u64, hash: &str) -> u32 
 /// textures it writes through unordered access are copied out in the list
 /// and saved once the list has run.
 pub(crate) fn dump_after(list: &crate::host::HostList, pipeline: crate::object::This, targets: &[usize]) {
+    dump_with_input(list, pipeline, targets, None);
+}
+
+pub(crate) fn dump_with_input(
+    list: &crate::host::HostList,
+    pipeline: crate::object::This,
+    targets: &[usize],
+    input: Option<InputDump>,
+) {
     let hashes = dump_after_hashes();
-    if hashes.is_empty() {
+    if hashes.is_empty() && input.is_none() {
         return;
     }
     let key = std::ptr::from_ref(list) as usize;
@@ -377,15 +446,27 @@ pub(crate) fn dump_after(list: &crate::host::HostList, pipeline: crate::object::
         }
         l != key
     });
-    if !recording_listed() {
+    if input.is_none() && !recording_listed() {
         return;
     }
-    let Some(hash) = named_after(hashes, &crate::pipeline::shaders_of(pipeline)) else {
+    let after = named_after(hashes, &crate::pipeline::shaders_of(pipeline));
+    let Some(hash) = after.or_else(|| input.as_ref().map(|i| &i.selector.hash)) else {
         return;
     };
-    let frame = crate::queue::presented() + 1;
+    let frame = input.as_ref().map_or_else(|| crate::queue::presented() + 1, |i| i.frame);
     static SEEN: std::sync::Mutex<Vec<(u64, String, u32)>> = std::sync::Mutex::new(Vec::new());
     let k = nth_after(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), frame, hash);
+    if let Some(i) = input {
+        let f = i.footprint.Footprint;
+        let name = format!(
+            "frame-{frame}-before-{hash}-{k}-s{}+{}-{:#x}-{}x{}-f{}",
+            i.selector.table, i.selector.dword, i.resource, f.Width, f.Height, f.Format.0,
+        );
+        defer_texture_png(list, i.buffer, i.footprint, name);
+    }
+    if after.is_none() {
+        return;
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, &resource) in textures.iter().enumerate() {
         let Some(copy) = crate::resource::host_copy(resource as crate::object::This) else { continue };
@@ -399,29 +480,38 @@ pub(crate) fn dump_after(list: &crate::host::HostList, pipeline: crate::object::
         crate::list::ensure_state(list, resource as crate::object::This, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         let Some((buffer, footprint)) = read_back(&host.device, &list.list, &copy.texture) else { continue };
         list.keep(&buffer);
-        struct Readback(ID3D12Resource);
-        // SAFETY: D3D12 objects are free-threaded.
-        unsafe impl Send for Readback {}
-        let buffer = Readback(buffer);
         let name = format!("frame-{frame}-after-{hash}-{k}-{i:02}-{resource:#x}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
-        list.defer_after(move || {
-            let f = footprint.Footprint;
-            let mut data = std::ptr::null_mut();
-            // SAFETY: the list has run; the mapping spans the footprint's rows.
-            unsafe {
-                if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-                    return;
-                }
-                let pitch = f.RowPitch as usize;
-                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-                match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-                    Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
-                    None => tracing::info!(format = f.Format.0, name, "texture after a draw not dumped: format"),
-                }
-                buffer.0.Unmap(0, None);
-            }
-        });
+        defer_texture_png(list, buffer, footprint, name);
     }
+}
+
+fn defer_texture_png(
+    list: &crate::host::HostList,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    name: String,
+) {
+    struct Readback(ID3D12Resource);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Readback {}
+    let buffer = Readback(buffer);
+    list.defer_after(move || {
+        let f = footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the list has run; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.0.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+            let pitch = f.RowPitch as usize;
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+            match to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+                Some(rgba) => save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba),
+                None => tracing::info!(format = f.Format.0, name, "texture not dumped: format"),
+            }
+            buffer.0.Unmap(0, None);
+        }
+    });
 }
 
 /// Whether frame `n` is saved.
@@ -1114,6 +1204,15 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_input_selector_requires_an_exact_shader_and_table_binding() {
+        let input = super::input_selector("DF11DCD012CD7382:s1+56").unwrap();
+        assert_eq!((input.hash.as_str(), input.table, input.dword), ("df11dcd012cd7382", 1, 56));
+        for bad in ["df11:s1+56", "df11dcd012cd7382:s256+56", "df11dcd012cd7382:s1-56", "wrong"] {
+            assert!(super::input_selector(bad).is_none());
+        }
+    }
+
     /// `VICTORY_DUMP_AFTER` names pipelines by any of their shaders' hashes
     /// (in either case), and numbers each one's draws from 0 in a frame.
     #[test]
@@ -1182,7 +1281,7 @@ mod tests {
         state.draw_indexed(&list, 3, 1, 0, 0, 0);
         state.dispatch_mesh(&list, 1);
         assert_eq!(crate::draw::attempted() - before, 3, "a draw, an indexed draw and a mesh dispatch, all dropped");
-        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1, None);
         assert_eq!(crate::draw::attempted() - before, 3, "a compute dispatch, dropped, is not one");
         list.close();
     }

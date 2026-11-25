@@ -111,16 +111,57 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
+
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_GROUP_BASE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
-    set_view_heap_limit, view_heap_limit, view_marks,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE,
+    USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_VIEW_RECORDS, VIEW_MARK_NONE, VIEW_WRITE_BITS, set_view_heap_limit, view_heap_limit,
+    view_marks,
 };
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+/// Optional diagnostic for the screen-probe traversal. Its eight u32s
+/// follow the normal page fault entries in the host's fault UAV.
+pub const RAY_PROBE_HASH: &str = "f22a76fcb967ee59";
+pub const RAY_PROBE_DWORDS: u32 = 8;
+
+pub fn ray_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(feature = "diagnostics")
+        && *ENABLED.get_or_init(|| {
+            std::env::var("VICTORY_CAPTURE_RAY_INTERSECTIONS").as_deref() == Ok(RAY_PROBE_HASH)
+        })
+}
+
+thread_local! {
+    static RAY_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Only the selected translation on this worker, including its lowering
+/// retries. Other parallel translations retain their ordinary output.
+fn with_ray_probe<T>(work: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RAY_PROBE.set(self.0);
+        }
+    }
+    let _restore = Reset(RAY_PROBE.replace(true));
+    work()
+}
+
+/// The caller matches the diagnostic container hash before using this entry.
+pub fn translate_ray_probe(container: &[u8]) -> Result<HostShader, ShaderError> {
+    if ray_probe_enabled() {
+        with_ray_probe(|| translate(container))
+    } else {
+        translate(container)
+    }
+}
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
@@ -280,6 +321,10 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Subset of root UAV slots through which this shader may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -684,7 +729,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -694,7 +739,15 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    // XboxBvhBuilder's Box32/16 rehydration kernels encode one header
+    // per *active* thread of the group. Their last group can be short.
+    let box_rehydration = matches!(
+        u128::from_be_bytes(c.digest),
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
+            | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -716,6 +769,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1091,6 +1146,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1103,6 +1160,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1570,6 +1629,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

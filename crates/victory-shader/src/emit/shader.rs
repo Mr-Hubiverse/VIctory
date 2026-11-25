@@ -93,6 +93,10 @@ pub const SLOT_VIEW_MARKS: u8 = 252;
 /// [`VIEW_WRITE_BITS`] bits those shaders set ([`SLOT_VIEW_MARKS`]), so the
 /// host copies back only what shaders wrote.
 pub const SLOT_VIEW_WRITES: u8 = 251;
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`]: the view
+/// address records a shader reads to turn a root UAV handle into the
+/// title address it writes, so the host learns written ranges precisely.
+pub const SLOT_VIEW_ADDRESSES: u8 = 250;
 /// A view-mark table entry's base for a slot whose writes are not marked.
 pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the [`SLOT_VIEW_WRITES`] bitmap; marks past it go to the last
@@ -108,6 +112,14 @@ pub fn view_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v != "0"))
 }
+
+/// The GFX10 record count of the structured SRV at descriptor-table `slot`
+/// and `dword`, as supplied by the title before adjusting the host view.
+pub const USER_VIEW_RECORDS: u32 = 0x105;
+/// Actual X thread count of a one-dimensional partial dispatch. Zero
+/// keeps all threads of every dispatched group active. The metadata's
+/// `dword` holds the group's X width, `index` the host binding.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -199,6 +211,10 @@ pub(crate) struct Shader {
     /// through it are marked by the index's view-mark entry,
     /// [`SLOT_VIEW_MARKS`]).
     pub view_index: std::collections::HashMap<V, V>,
+    /// Root UAV slots whose emitted operations may modify buffer contents.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -211,6 +227,52 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+}
+
+#[cfg(test)]
+#[test]
+fn only_the_written_root_uavs_need_a_guest_writeback() {
+    let mut s = Shader::new(false);
+    let input = s.root_uav_handle(1, false);
+    let output = s.root_uav_handle(2, false);
+    let counter = s.root_uav_handle(3, false);
+    let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+    let undef = s.m.undef(s.t.i32);
+    for handle in [input, output] {
+        s.op(
+            s.entry,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            139,
+            &[handle, zero, undef, mask, align],
+        );
+    }
+    s.op(
+        s.entry,
+        "rawBufferStore.i32",
+        Attr::NoUnwind,
+        s.t.void,
+        140,
+        &[output, zero, undef, one, undef, undef, undef, mask, align],
+    );
+    s.op(
+        s.entry,
+        "atomicBinOp.i32",
+        Attr::NoUnwind,
+        s.t.i32,
+        78,
+        &[counter, zero, zero, undef, undef, one],
+    );
+    s.op(
+        s.entry,
+        "atomicCompareExchange.i32",
+        Attr::NoUnwind,
+        s.t.i32,
+        79,
+        &[counter, zero, undef, undef, zero, one],
+    );
+    assert_eq!(s.written_root_uavs, [2, 3]);
 }
 
 impl Shader {
@@ -258,6 +320,8 @@ impl Shader {
             root_uavs: Vec::new(),
             root_uavs_shared: false,
             view_index: std::collections::HashMap::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -291,6 +355,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Raw root UAVs are also legal inputs. Only a read through a handle
+        // is known to leave it unchanged. Treat any other use of the handle
+        // conservatively, including atomics and future operations.
+        if !matches!(opcode, 68 | 72 | 139) // BufferLoad, GetDimensions, RawBufferLoad
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
