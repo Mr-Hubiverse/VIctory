@@ -95,6 +95,13 @@ keyboard acts as one while the game window has focus.
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
 time on the test machines. Set them in PowerShell before running the script.
 
+victory-fork measured 8-10 fps in the first rooms (RTX 4070) with this set:
+`VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1
+VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64
+VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1
+VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1
+VICTORY_CARD_REHASH_RUNS=1`.
+
 ## Debugging switches
 
 | Switch | Effect |
@@ -105,6 +112,26 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
+
+Further switches carried from victory-fork:
+
+| Switch | Effect |
+|---|---|
+| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_DUMP_TARGETS=1` | with capture, saves every render target of those frames |
+| `VICTORY_D3D12_DEBUG=1` / `VICTORY_D3D12_GBV=1` | host debug layer / GPU-based validation |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches whose pipeline contains a listed shader hash |
+| `VICTORY_GPU_TIMING=1` | run and time each list of a submission on its own |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+Every build appends crashes and host GPU failures to `crashes.log` in the
+title's data folder.
 
 ## License
 
