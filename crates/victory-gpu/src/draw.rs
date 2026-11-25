@@ -1948,7 +1948,7 @@ impl State {
                 crate::texture::upload_again(resource);
             }
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, None);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2486,7 +2486,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, Some((host, index)));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2611,7 +2611,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, Some((host, first + u.table_offset_dwords / 8)));
                     }
                 }
                 for k in selected {
@@ -2622,7 +2622,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, Some((host, first + k)));
                     }
                 }
                 made.push((slot, first * 32));
@@ -2660,7 +2660,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, Some((host, index)));
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3289,7 +3289,12 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(
+    list: &HostList,
+    kind: ResourceType,
+    view: &View,
+    mark_slot: Option<(&crate::descriptor::host::HostHeap, u32)>,
+) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3301,9 +3306,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                // A view of the heap: writes through it mark their pages
-                // (`crate::shadow::mark_entry`, at the view's table slot).
-                shadow.gpu_writes(list, address, len, true);
+                // A view of the heap whose slot has a mark entry: writes
+                // through it mark their pages (`HostHeap::mark_at`, which
+                // also gives the slot its entry where it still held
+                // none). A slot that cannot mark leaves the range
+                // declared: the writes are compared as before.
+                let marked = mark_slot.is_some_and(|(heap, index)| heap.mark_at(index, view));
+                shadow.gpu_writes(list, address, len, marked);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

@@ -970,6 +970,34 @@ impl HostHeap {
         self.marks.as_ref().map(|m| &m.0)
     }
 
+    /// Slot `index`'s mark entry written for `view` as it stands now, and
+    /// whether writes through the slot mark their pages. A view first noted
+    /// before its memory had a host copy holds `VIEW_MARK_NONE` in the
+    /// table still; a copy made since is given its entry here, where the
+    /// slot is known ([`note_buffer`] only runs when the slot's view
+    /// changes). False where the slot has no entry to give (past the
+    /// table) or the view's copy marks nothing: those declare their
+    /// writes instead.
+    pub(crate) fn mark_at(&self, index: u32, view: &View) -> bool {
+        let Some((_, _, data)) = &self.marks else {
+            return false;
+        };
+        if index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return false;
+        }
+        let Some((base, phase)) = buffer_copy(view).and_then(|(s, a, _)| s.mark_entry(a)) else {
+            return false;
+        };
+        // SAFETY: inside the mapping; shaders read it while we write (a
+        // dword pair, either value is one the slot had).
+        unsafe {
+            let at = (*data as *mut u32).add(index as usize * 2);
+            at.write_volatile(base);
+            at.add(1).write_volatile(phase);
+        }
+        true
+    }
+
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {

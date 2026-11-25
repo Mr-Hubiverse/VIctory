@@ -101,8 +101,10 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 
 /// Whether unordered buffer view writes mark their pages (`VICTORY_VIEW_MARKS`,
 /// off unless asked for): a shader translated without it does not declare the
-/// two root views, and code reading an unbound one hung the card.
-pub(crate) fn view_marks() -> bool {
+/// two root views, and code reading an unbound one hung the card. The host
+/// reads the same switch: a copy's pages can only be marked when shaders can
+/// mark them, or their writes would never be looked for.
+pub fn view_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v != "0"))
 }

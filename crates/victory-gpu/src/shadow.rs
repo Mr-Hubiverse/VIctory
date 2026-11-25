@@ -1726,7 +1726,12 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
-            marks: marks().take(pages_of_title(start, len)),
+            // Only when translated shaders can mark (`VICTORY_VIEW_MARKS`):
+            // a declared-marked write whose bits are never set is never
+            // looked for, so a copy must not take a run it cannot fill.
+            marks: victory_shader::emit::view_marks()
+                .then(|| marks().take(pages_of_title(start, len)))
+                .flatten(),
             buffer,
             data,
             gpu,
