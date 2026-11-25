@@ -109,6 +109,7 @@ mod wave64_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
+use crate::gfx10::{Fields, Operand, Valu};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
@@ -423,6 +424,16 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if native.stage == HwStage::Ps
+        && let Some(inst) = p.blocks.iter().flat_map(|b| &b.insts).find(|i| uses_pops(i))
+    {
+        // The native wait and completion are part of a critical section
+        // around UAV accesses. DXIL needs equivalent rasterizer ordering.
+        return Err(ShaderError::Unsupported {
+            offset: inst.machine.offset,
+            what: "primitive-ordered pixel shading (POPS)",
+        });
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -714,6 +725,24 @@ fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
         0x56d5f614_619f530c_f1cf2b90_43b580e8 | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
         | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
         _ => &[],
+    }
+}
+
+fn uses_pops(inst: &ir::Inst) -> bool {
+    const EXITING_WAVE_ID: Operand = Operand::Const(239);
+    const POPS_PACKER: u16 = 25;
+    const ORDERED_PS_DONE: u16 = 7;
+
+    match (inst.name(), &inst.fields) {
+        ("s_endpgm_ordered_ps_done", _) => true,
+        ("s_sendmsg", Fields::Sopp { imm }) => imm & 0xf == ORDERED_PS_DONE,
+        ("s_setreg_b32" | "s_setreg_imm32_b32", Fields::Sop { imm: Some(imm), .. }) => {
+            imm & 0x3f == POPS_PACKER
+        }
+        (_, Fields::Sop { src, .. } | Fields::Valu(Valu { src, .. })) => {
+            src.contains(&EXITING_WAVE_ID)
+        }
+        _ => false,
     }
 }
 
@@ -2017,6 +2046,30 @@ mod barycentric_tests {
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
         pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    #[test]
+    fn pixel_ordering_requires_native_pops_support() {
+        for marker in [
+            0xb982_0019, // s_setreg_b32 hwreg(POPS_PACKER, 0, 1), s2
+            0x8100_80ef, // s_add_i32 s0, src_pops_exiting_wave_id, 0
+            0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
+            0xbf9e_0000, // s_endpgm_ordered_ps_done
+        ] {
+            let error = pixel(&[0xbf80_0000, marker, 0xbf81_0000], 0)
+                .err()
+                .expect("POPS requires rasterizer ordering");
+            assert!(
+                matches!(
+                    error,
+                    ShaderError::Unsupported {
+                        offset: 4,
+                        what: "primitive-ordered pixel shading (POPS)",
+                    }
+                ),
+                "{marker:#x}: {error:?}"
+            );
+        }
     }
 
     pub(super) fn pixel_with_inputs(
