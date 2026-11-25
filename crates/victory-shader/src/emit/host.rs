@@ -63,7 +63,8 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the adapter `VICTORY_ADAPTER` names (a part of its description).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -84,6 +85,42 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(want) = std::env::var("VICTORY_ADAPTER")
+                .ok()
+                .filter(|v| !v.is_empty())
+            {
+                // `VICTORY_ADAPTER`: the first adapter whose description
+                // contains this text (any case), for machines with more
+                // than one GPU, where the default may not be the one under
+                // test.
+                let want = want.to_lowercase();
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let mut seen = Vec::new();
+                let mut i = 0;
+                while let Ok(adapter) = factory.EnumAdapters1(i) {
+                    i += 1;
+                    let desc = adapter.GetDesc1().map_err(err)?;
+                    let end = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    let name = String::from_utf16_lossy(&desc.Description[..end]);
+                    if name.to_lowercase().contains(&want) {
+                        eprintln!("VICTORY_ADAPTER: {name}");
+                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            .map_err(err)?;
+                        break;
+                    }
+                    seen.push(name);
+                }
+                if device.is_none() {
+                    return Err(format!(
+                        "VICTORY_ADAPTER={want} matches none of: {}",
+                        seen.join(", ")
+                    ));
+                }
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 // A machine without a graphics card gives the software
