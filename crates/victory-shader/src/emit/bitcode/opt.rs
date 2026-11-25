@@ -30,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -206,12 +206,14 @@ pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
-        // A shader cannot write a constant buffer or resize a resource.
-        Some(Attr::ReadOnly)
-            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
-        {
-            Effect::Pure
-        }
+        // A shader cannot write a constant buffer.
+        Some(Attr::ReadOnly) if name.starts_with("cbufferLoadLegacy") => Effect::Pure,
+        // Nor resize a resource, but a size is reused within its block only
+        // ([`LOADS`], not [`REUSE`]): one size read in later blocks too
+        // made AMD's RDNA 4 compiler (amdxc64 for gfx1201) fault while
+        // building a ray-tracing resolve program of the title, which RDNA 3's
+        // builds (see also `own_heap_handles`).
+        Some(Attr::ReadOnly) if name.starts_with("getDimensions") => Effect::Reads,
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
@@ -242,9 +244,103 @@ impl Module {
                 }
             }
         }
+        // Before the dead-code pass: a heap handle no annotation reads any
+        // more goes with it.
+        self.own_heap_handles();
         if passes & DEAD != 0 {
             self.drop_dead();
         }
+    }
+
+    /// Undoes what [`REUSE`] merged of heap handles: an annotation that
+    /// reads a handle another annotation reads too, or one made in another
+    /// block, gets a handle of its own made just before it, from an index
+    /// of its own where that is arithmetic. The lowering makes a handle
+    /// beside each annotation; merged, one handle (or one index value) was
+    /// annotated as two kinds where the title reads a descriptor two ways
+    /// (a raw buffer and a structured or constant buffer), or read across
+    /// blocks. The DXIL validator accepts that and RDNA 3's compiler builds
+    /// it, but AMD's RDNA 4 compiler (amdxc64 for gfx1201) faults while
+    /// building such pipelines (a ray-tracing resolve and a tree-animation
+    /// skinning program of the title). Annotated handles stay merged.
+    fn own_heap_handles(&mut self) {
+        let (Some(&heap), Some(&annotate)) = (
+            self.func_ids.get("dx.op.createHandleFromHeap"),
+            self.func_ids.get("dx.op.annotateHandle"),
+        ) else {
+            return;
+        };
+        // Each heap handle's block.
+        let mut home: HashMap<u32, usize> = HashMap::new();
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &i in &block.body {
+                if let Op::Call(f, args) = &self.insts[i as usize].op
+                    && *f == heap
+                    && args.len() == 4
+                {
+                    home.insert(i, b);
+                }
+            }
+        }
+        // The annotations that read a heap handle another one reads too, or
+        // one made in another block: the first in the handle's own block
+        // keeps it.
+        let mut kept: HashSet<u32> = HashSet::new();
+        let mut moved: Vec<(usize, u32, u32)> = Vec::new();
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &a in &block.body {
+                let Op::Call(f, args) = &self.insts[a as usize].op else { continue };
+                if *f != annotate || args.len() != 3 {
+                    continue;
+                }
+                let V::Inst(h) = args[1] else { continue };
+                let Some(&made) = home.get(&h) else { continue };
+                if made == b && kept.insert(h) {
+                    continue;
+                }
+                moved.push((b, a, h));
+            }
+        }
+        for (b, a, h) in moved {
+            let Op::Call(_, args) = &self.insts[h as usize].op else { continue };
+            let index = args[1];
+            // The index made again too where it is arithmetic on values
+            // every path has (not a join, nor a call such as a wave
+            // operation, which answers for the lanes where it stands).
+            let index = match index {
+                V::Inst(d) if matches!(self.insts[d as usize].op, Op::Bin(..) | Op::Cast(..)) => {
+                    self.copy_before(d, b, a)
+                }
+                other => other,
+            };
+            let mine = self.copy_before(h, b, a);
+            if let V::Inst(m) = mine
+                && let Op::Call(_, args) = &mut self.insts[m as usize].op
+            {
+                args[1] = index;
+            }
+            if let Op::Call(_, args) = &mut self.insts[a as usize].op {
+                args[1] = mine;
+            }
+        }
+    }
+
+    /// A copy of instruction `i`, placed in block `b` just before
+    /// instruction `at` (which `i` reaches: what `i` reads stands there).
+    fn copy_before(&mut self, i: u32, b: usize, at: u32) -> V {
+        let copy = self.insts.len() as u32;
+        let inst = super::Inst {
+            ty: self.insts[i as usize].ty,
+            op: self.insts[i as usize].op.clone(),
+        };
+        self.insts.push(inst);
+        if let Some(&tag) = self.tags.get(&i) {
+            self.tags.insert(copy, tag);
+        }
+        let body = &mut self.blocks[b].body;
+        let position = body.iter().position(|&x| x == at).expect("`at` is in block `b`");
+        body.insert(position, copy);
+        V::Inst(copy)
     }
 
     /// Per function: what a call of it does.
@@ -1166,6 +1262,86 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
+    }
+
+    /// One descriptor address made a heap handle twice, annotated as
+    /// `first` in block `b` and as `second` in block `b` or, with `apart`,
+    /// in the block after it, then the clean-up. For each annotation: its
+    /// block, its handle, and that handle's index and block.
+    fn heap_reads(first: u32, second: u32, apart: bool) -> Vec<(usize, V, V, usize)> {
+        let Kit {
+            mut m, b, reads, writes, ..
+        } = kit();
+        let i32t = m.int(32);
+        let heap_ty = m.func_ty(i32t, vec![i32t, i32t, i32t, i32t]);
+        m.ptr(heap_ty);
+        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+        let note_ty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        m.ptr(note_ty);
+        let note = m.function("dx.op.annotateHandle", note_ty, Some(Attr::ReadNone), false);
+        let (zero, five, k218, k216) = (m.i32(0), m.i32(5), m.i32(218), m.i32(216));
+        let (first, second) = (m.i32(first), m.i32(second));
+        let next = if apart { m.new_block() } else { b };
+        // A descriptor address read from memory, made a heap index twice.
+        let address = m.call(b, reads, vec![zero, zero]);
+        let mut annotated = Vec::new();
+        for (block, props) in [(b, first), (next, second)] {
+            let index = m.bin(block, Bin::LShr, address, five);
+            let h = m.call(block, heap, vec![k218, index, zero, zero]);
+            annotated.push(m.call(block, note, vec![k216, h, props]));
+        }
+        if apart {
+            m.terminate(b, Term::Br(next));
+        }
+        m.call(next, writes, annotated);
+        m.terminate(next, Term::Ret);
+        m.optimise(MODULE);
+        m.write();
+        let block_of = |m: &Module, v: V| {
+            let V::Inst(i) = v else { panic!("an instruction") };
+            m.blocks.iter().position(|blk| blk.body.contains(&i)).expect("in a block")
+        };
+        let operand = |m: &Module, v: V| {
+            let V::Inst(i) = v else { panic!("an instruction") };
+            let Op::Call(_, args) = &m.insts[i as usize].op else { panic!("a call") };
+            args[1]
+        };
+        // The store is the last instruction; it reads the annotations.
+        let &store = m.blocks[next].body.last().expect("the store");
+        let Op::Call(_, stored) = &m.insts[store as usize].op else { panic!("a call") };
+        stored
+            .iter()
+            .map(|&a| {
+                let h = operand(&m, a);
+                (block_of(&m, a), h, operand(&m, h), block_of(&m, h))
+            })
+            .collect()
+    }
+
+    /// [`REUSE`] merges a heap handle read as two kinds; each kind's
+    /// annotation gets a handle and an index of its own back (AMD's RDNA 4
+    /// compiler faulted on shared ones). Read as one kind twice, the
+    /// annotation itself is merged and stays one.
+    #[test]
+    fn each_heap_annotation_reads_a_handle_and_index_of_its_own() {
+        let reads = heap_reads(11, 12, false);
+        let [(_, h1, i1, _), (_, h2, i2, _)] = reads[..] else { panic!("two annotations") };
+        assert_ne!(h1, h2, "a handle each");
+        assert_ne!(i1, i2, "an index each");
+        let reads = heap_reads(11, 11, false);
+        let [(_, h1, ..), (_, h2, ..)] = reads[..] else { panic!("two annotations") };
+        assert_eq!(h1, h2, "one kind: one handle");
+    }
+
+    /// A heap handle merged into one made in an earlier block is made again
+    /// in the block of the annotation that reads it.
+    #[test]
+    fn a_heap_handle_is_made_in_the_block_that_annotates_it() {
+        let reads = heap_reads(11, 12, true);
+        let [(b1, h1, _, hb1), (b2, h2, _, hb2)] = reads[..] else { panic!("two annotations") };
+        assert_ne!(b1, b2);
+        assert_ne!(h1, h2);
+        assert_eq!((hb1, hb2), (b1, b2), "each handle in its annotation's block");
     }
 
     #[test]
