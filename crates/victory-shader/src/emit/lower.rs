@@ -2701,6 +2701,8 @@ impl<'a> Lower<'a> {
         match rp.root {
             RootType::ResourceHeap | RootType::SamplerHeap => return Val::I32(self.s.m.i32(0)),
             RootType::Constants | RootType::Table => {}
+            // The dispatch's thread count, which the host sets (`spill::thread_limited`).
+            RootType::Other(super::shader::USER_DISPATCH_THREADS_X) => {}
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword - self.user_first();

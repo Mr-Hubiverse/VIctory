@@ -397,6 +397,13 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    // A host of 32-lane waves cannot take the early exit of `lower_with_thread_limit`
+    // (see `spill::thread_limited`): the thread count masks EXEC ahead of the program.
+    let native = if lower::host_max_wave() == 32 {
+        crate::spill::thread_limited(native)
+    } else {
+        native
+    };
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -793,7 +800,9 @@ fn emit_program(
         u128::from_be_bytes(c.digest),
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
-    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1])
+        // (on a host of 32-lane waves the count already masks EXEC: `translate`)
+        && lower::host_max_wave() != 32;
     let l = lower::lower_program(&parts, box_rehydration, tiled_lighting_uint_srvs(c.digest))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
