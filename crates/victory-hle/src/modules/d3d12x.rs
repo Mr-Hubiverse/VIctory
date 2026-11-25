@@ -72,6 +72,18 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
 
+/// Detect the adapter settings used by the runtime shader cache.
+pub fn prepare_shader_warmup() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::prepare_shader_warmup()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("shader warm-up requires a D3D12 device on Windows".into())
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

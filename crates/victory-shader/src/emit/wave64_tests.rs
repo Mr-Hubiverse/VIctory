@@ -713,3 +713,66 @@ fn partial_thread_dispatch_on_32_lane_host_emits_wave32_and_masks_wave_counts_an
         }
     }
 }
+
+#[test]
+fn backward_permute_reads_the_other_half_of_a_console_wave() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let body = [
+        0x4A04_00A0, // v_add_nc_u32 v2, 32, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0xDACC_0000, 0x0100_0002, // ds_bpermute_b32 v1, v2, v0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000, 0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+    ];
+    let mut shaders = Vec::new();
+    for threads in [64, 32] {
+        let native = native_of(&body, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        for wave in [32, 64] {
+            let shader = lowered_for_width(&native, &p, &HashSet::new(), wave).expect("lower permute");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            shaders.push((threads, wave, shader));
+        }
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; dispatch skipped");
+        return;
+    };
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: caps is the out buffer for this feature query.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    }.expect("wave capabilities");
+    for (threads, wave, shader) in shaders {
+        if !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&wave) {
+            eprintln!("wave{wave} unavailable; dispatch skipped");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("permute compute pipeline");
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).expect("permute dispatch");
+        let expected = (0..threads).map(|lane| if threads == 64 { lane ^ 32 } else { 0 }).collect::<Vec<_>>();
+        assert_eq!(out[0], expected, "wave{wave}, {threads} threads");
+        eprintln!("wave{wave}, {threads} threads: verified every lane on the GPU");
+    }
+}

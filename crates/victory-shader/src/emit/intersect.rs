@@ -53,6 +53,7 @@ enum NodeAt {
         low: V,
         high: V,
         mapped: V,
+        slot: V,
     },
 }
 
@@ -169,13 +170,15 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (slot, byte, mapped) = self.bvh_memory(low, high, guard);
+                let handle = self.bvh_handle(slot);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
+                    slot,
                 }
             }
         };
@@ -338,7 +341,6 @@ impl<'a> Lower<'a> {
             // which is zeros.
             let c = self.cur;
             let slot = self.s.m.i32(slot);
-            let handle = self.s.heap_handle(c, slot, false, false, (11, 0));
             let (base_low, base_high) =
                 (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
             let at = self.s.m.bin(c, Bin::Sub, low, base_low);
@@ -347,9 +349,17 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at, inside);
+            return (slot, at, inside);
         }
-        self.memory(low, high, guard)
+        self.memory_location(low, high, guard)
+    }
+
+    fn bvh_handle(&mut self, slot: V) -> V {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            return self.s.heap_handle(self.cur, slot, false, false, (11, 0));
+        }
+        self.memory_handle(slot)
     }
 
     /// The second 64-byte half of a Box32 node can belong to a different
@@ -361,15 +371,25 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 NodeAt::Buffer { handle, byte }
             }
-            NodeAt::Memory { low, high, .. } => {
-                let (low, high) = self.address_plus(low, high, 64);
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
+            NodeAt::Memory { low, high, slot, byte, mapped, .. } => {
+                let c = self.cur;
+                let size = self.s.m.i32(64);
+                let next = self.s.m.bin(c, Bin::Add, byte, size);
+                let mask = self.s.m.i32(0xffff);
+                let end = self.s.m.i32(0xffc0);
+                let within = self.s.m.bin(c, Bin::And, low, mask);
+                let crosses = self.s.m.cmp(c, pred::EQ, within, end);
+                let gate = self.begin_guarded(Some(crosses));
+                let (next_low, next_high) = self.address_plus(low, high, 64);
+                let (tail_slot, tail_byte, tail_mapped) = self.bvh_memory(next_low, next_high, None);
+                let selected = self.end_guarded(gate, &[(tail_slot, slot), (tail_byte, next), (tail_mapped, mapped)]);
                 NodeAt::Memory {
-                    handle,
-                    byte,
+                    handle: self.bvh_handle(selected[0]),
+                    byte: selected[1],
                     low,
                     high,
-                    mapped,
+                    mapped: selected[2],
+                    slot: selected[0],
                 }
             }
         }
@@ -449,7 +469,8 @@ impl<'a> Lower<'a> {
         let second = self.bvh_second_half(at);
         words.extend(self.bvh_node_words(second, None, 0, 12));
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let wide_end = self.cur;
+        self.s.m.terminate(wide_end, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -482,7 +503,7 @@ impl<'a> Lower<'a> {
                 let mapped = self.s.m.phi(join, self.s.m.type_of(first));
                 self.s
                     .m
-                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
+                    .set_phi(mapped, vec![(last, wide_end), (first, half_block)]);
                 let both = self.s.m.bin(join, Bin::And, first, mapped);
                 Some([first, first, both, both])
             }
@@ -493,7 +514,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

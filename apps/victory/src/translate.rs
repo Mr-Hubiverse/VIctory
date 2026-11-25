@@ -396,6 +396,8 @@ pub fn run(
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    victory_hle::modules::d3d12x::prepare_shader_warmup().map_err(anyhow::Error::msg)?;
+    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -403,8 +405,10 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
     let started = std::time::Instant::now();
-    for root in &paths {
+    let time_is_up = || limit.is_some_and(|n| started.elapsed().as_secs() >= n);
+    'scan: for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if time_is_up() { break 'scan; }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -417,6 +421,7 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if time_is_up() { break; }
                             let Some(bytes) = job.bytes() else { continue };
                             let Ok(container) = Container::parse(&bytes) else { continue };
                             // As the title passes it: no more than the container.
