@@ -220,6 +220,10 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Threads of different groups take turns through atomics (a tree built
+    /// from its leaves up): what they wrote before one must be seen after
+    /// it. The console's program waits for its writes there.
+    ordered: Option<bool>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1538,6 +1542,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            ordered: None,
             src0: None,
             console_lanes,
             split_lds,
@@ -2858,7 +2863,7 @@ impl<'a> Lower<'a> {
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let place = self.s.m.select(c, missing, place, zero);
-        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS, false);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
@@ -4158,7 +4163,7 @@ impl<'a> Lower<'a> {
             let over = self.s.m.cmp(c, pred::IUGT, n, cap);
             bits.push(self.s.m.select(c, over, cap, n));
         }
-        let bitmap = self.s.root_uav_handle(super::shader::SLOT_VIEW_WRITES);
+        let bitmap = self.s.root_uav_handle(super::shader::SLOT_VIEW_WRITES, false);
         let outer = self.begin_guarded(Some(active));
         for (i, &n) in bits.iter().enumerate() {
             let c = self.cur;
@@ -4903,6 +4908,11 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        let fence = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
+            && self.ordered();
+        if fence {
+            self.uav_fence();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4948,6 +4958,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if fence && r.is_ok() {
+            self.uav_fence();
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -4966,6 +4979,28 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// See [`Lower::ordered`]: programs that reach memory by address or
+    /// write through root views, which are the builders of ray tracing's
+    /// structures.
+    fn ordered(&mut self) -> bool {
+        let x = self.x;
+        *self.ordered.get_or_insert_with(|| {
+            super::rays()
+                && (x.res.scalar.iter().any(|(_, a)| a.param == MEMORY)
+                    || x.native.used.iter().any(|u| {
+                        u.root == RootType::Descriptor && u.kind == ResourceType::Uav
+                    }))
+        })
+    }
+
+    /// Writes to buffers made before are seen before those made after, by
+    /// every group.
+    fn uav_fence(&mut self) {
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -6430,7 +6465,9 @@ impl<'a> Lower<'a> {
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
-                        Ok(self.s.root_uav_handle(rp.slot))
+                        // Other groups write what a builder reads.
+                        let shared = self.ordered();
+                        Ok(self.s.root_uav_handle(rp.slot, shared))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 0x100b) => {
                         Err("a write through a root SRV")

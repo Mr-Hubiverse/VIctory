@@ -367,6 +367,31 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// [`pages_of`] of every 64 KiB page of `[start, end)` in one look under
+/// the views' lock (a call a page took it that many times, and every
+/// copy's check waits for the guards' lock that look is under).
+pub(crate) fn pages_of_each(start: usize, end: usize) -> Vec<Vec<usize>> {
+    let v = views();
+    let mut out = Vec::with_capacity(end.saturating_sub(start).div_ceil(K64));
+    let mut page = start - start % K64;
+    while page < end {
+        let shown = match v.views.range(..=page).next_back() {
+            Some((&base, &(bytes, section, offset)))
+                if page - base < bytes && (page - base).is_multiple_of(K64) =>
+            {
+                v.pages
+                    .get(&(section, offset + (page - base) as u64))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        out.push(shown);
+        page = page.saturating_add(K64);
+    }
+    out
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).

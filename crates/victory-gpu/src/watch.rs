@@ -482,14 +482,35 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Blocks the kernel is about to write for the runtime ([`writing`]),
+    /// from, to, and until when they are left writable: a read may be
+    /// asynchronous and land after the call that asked for it returned, and
+    /// the kernel does not fault into our handler, it fails. Until then
+    /// they are not made read-only, and every check reports them written.
+    pins: Vec<(usize, usize, std::time::Instant)>,
 }
+
+/// How long blocks stay writable after [`writing`] (no time at all in
+/// tests: the checks it changes are their subject).
+#[cfg(not(test))]
+const PIN: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const PIN: std::time::Duration = std::time::Duration::ZERO;
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    pins: Vec::new(),
 });
+
+impl Guards {
+    /// Whether `block` is left writable for a kernel write.
+    fn pinned(&self, block: usize) -> bool {
+        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -517,6 +538,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
+    if !g.pins.is_empty() {
+        let now = std::time::Instant::now();
+        g.pins.retain(|&(_, _, until)| until > now);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -551,7 +576,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if g.pinned(block) {
+                // The kernel may be writing it: left writable, reported
+                // written at every check until the pin ends.
+            } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
             } else {
@@ -621,11 +649,15 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    // One look at the views for the whole run, and no list made for a page
+    // with one view (most of them): this runs under the guards' lock, which
+    // every copy's check waits for.
+    let each = crate::inplace::pages_of_each(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK));
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
+            let shown = &each[block - from];
             // One view (nothing else to guard), or the page the title shows
             // wherever it has nothing (thousands of views): each view of
             // that one is guarded by itself.
@@ -634,7 +666,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
+            for &alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block {
@@ -671,7 +703,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || g.pinned(block) {
         return;
     }
     let mut old = 0;
@@ -772,12 +804,41 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
+/// kernel (which does not fault into our handler): opens its guarded blocks
+/// and leaves them writable for [`PIN`] — the read may be asynchronous and
+/// land after the call that asked for it returned, and the kernel fails
+/// into a block guarded again, it does not fault to us. The blocks'
+/// copies are told written at every check meanwhile.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let until = std::time::Instant::now() + PIN;
+    g.pins.push((first, last, until));
+    open(&mut g, at, at.saturating_add(len));
+    if view_guard() {
+        // The same pages at their other views: the write lands in them
+        // too, so their copies must take them again, now and when it has
+        // landed.
+        for block in first..last {
+            let shown = crate::inplace::pages_of(block * BLOCK);
+            if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                continue;
+            }
+            for alias in shown {
+                if alias / BLOCK != block {
+                    g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                    open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                }
+            }
+        }
+    }
+    drop(g);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -950,6 +1011,22 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // A view mapped a moment ago may already have been made read-only
+        // as another view of a guarded page (between the runtime's
+        // `title_memory_view` and this call): it is given back, or the
+        // title's next write there would fault with no guard to answer
+        // for it.
+        let mut old = 0;
+        // SAFETY: only the protection of title view memory changes; the
+        // call fails harmlessly on memory that is no longer a view.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                (block * BLOCK) as *const _,
+                BLOCK,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                &mut old,
+            )
+        };
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -986,10 +1063,23 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Read-only, in a view we were told of, and not noted guarded:
+        // only we make title views read-only, so it is ours to give back.
+        if view_guard() && !crate::inplace::pages_of(at - at % BLOCK).is_empty() {
+            use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+            let mut old = 0;
+            let block = at - at % BLOCK;
+            // SAFETY: only the protection of title view memory changes.
+            let opened =
+                unsafe { VirtualProtect(block as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+            if opened {
+                tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block that no guard knew was opened");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.

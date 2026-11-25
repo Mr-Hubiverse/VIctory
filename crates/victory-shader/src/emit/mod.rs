@@ -158,6 +158,21 @@ pub fn loop_limit() -> u32 {
 ///   whether a barrier is what stops the card: with it no run can stand in
 ///   a barrier.
 ///
+/// The ray-tracing structure builder may run (`VICTORY_BVH_BUILDER=1`,
+/// `victory-gpu` reads the same switch): its programs, and programs that
+/// reach memory by address or write through root views like it, get a UAV
+/// fence on both sides of each buffer atomic and globally coherent root
+/// UAVs — the console's waits for writes (`s_waitcnt`) the translation
+/// drops otherwise leave a group able to read another's unfinished
+/// writes (a structure built from its leaves up).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub(crate) fn rays() -> bool {
+    static RAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RAYS.get_or_init(|| std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| v == "1"))
+}
+
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
