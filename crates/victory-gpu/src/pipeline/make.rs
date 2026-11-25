@@ -148,6 +148,7 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
+        let _making = Making::begin(self);
         self.made.get_or_init(|| {
             static BAD_SHADERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
             let bad = BAD_SHADERS.get_or_init(|| {
@@ -225,6 +226,59 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// The pipelines being made now, by thread, for crash reports: a host
+/// driver that faults while compiling one leaves no other trace of which
+/// it was (its pipeline is logged only once made).
+static IN_FLIGHT: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+/// A pipeline in [`IN_FLIGHT`] while it is being made.
+struct Making(std::thread::ThreadId);
+
+impl Making {
+    fn begin(p: &Pending) -> Making {
+        let thread = std::thread::current();
+        let state = p
+            .graphics
+            .as_ref()
+            .map(|g| format!(" state {}", g.describe()))
+            .unwrap_or_default();
+        let what = format!(
+            "{:?} on thread {:?}, key {}{state}",
+            p.shaders,
+            thread.name().unwrap_or("?"),
+            p.key
+        );
+        IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push((thread.id(), what));
+        Making(thread.id())
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        let mut making = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = making.iter().position(|(thread, _)| *thread == self.0) {
+            making.swap_remove(i);
+        }
+    }
+}
+
+/// For crash reports: one line per pipeline being made, the faulting
+/// (calling) thread's marked. Never waits: nothing if another thread holds
+/// the list at that moment.
+pub(crate) fn being_made() -> String {
+    let Ok(making) = IN_FLIGHT.try_lock() else {
+        return "  pipelines being made: not known (the list was in use)\n".to_owned();
+    };
+    let here = std::thread::current().id();
+    making
+        .iter()
+        .map(|(thread, what)| {
+            let mark = if *thread == here { " (this thread)" } else { "" };
+            format!("  pipeline being made{mark}: {what}\n")
+        })
+        .collect()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -1007,6 +1061,29 @@ mod tests {
         assert!(stuck(&p));
         assert_eq!(WORKERS_STARTED.load(Ordering::Relaxed), before + 1);
         assert!(p.made.get().is_none());
+    }
+
+    /// A crash report names the pipeline being made, on the thread making
+    /// it, and drops it once made. Other tests' workers may be making their
+    /// own meanwhile: only this key is looked for.
+    #[test]
+    fn crash_report_names_the_pipeline_being_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "crash-report-test-key".to_owned();
+        let line = |report: &str| {
+            report
+                .lines()
+                .find(|l| l.contains("crash-report-test-key"))
+                .map(str::to_owned)
+        };
+        let making = Making::begin(&p);
+        let named = line(&being_made()).expect("the pipeline being made is listed");
+        assert!(named.contains("(this thread)"), "{named}");
+        let elsewhere = std::thread::scope(|s| s.spawn(being_made).join().unwrap());
+        let named = line(&elsewhere).expect("listed for other threads too");
+        assert!(!named.contains("(this thread)"), "{named}");
+        drop(making);
+        assert_eq!(line(&being_made()), None);
     }
 
     #[test]

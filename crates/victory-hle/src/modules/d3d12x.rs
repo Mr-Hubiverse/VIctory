@@ -21,6 +21,13 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    // A host driver that faults while compiling a pipeline: the report
+    // names the pipelines being made.
+    #[cfg(windows)]
+    {
+        static ADDED: std::sync::Once = std::sync::Once::new();
+        ADDED.call_once(|| victory_loader::add_crash_context(victory_gpu::pipeline::being_made));
+    }
     device::create(adapter, parameters, iid, out)
 }
 

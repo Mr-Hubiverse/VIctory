@@ -246,6 +246,13 @@ pub fn run(
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
+    // A host driver that faults while compiling ends the process: the
+    // report names the shader each thread was making a pipeline for.
+    #[cfg(windows)]
+    if pipelines {
+        victory_loader::report_crashes();
+        victory_loader::add_crash_context(building);
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -487,6 +494,20 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // `VICTORY_TRANSLATE_SKIP=<hash prefix>,...`: those containers left out
+    // (one whose pipeline faults the host driver, to get past it).
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if skip.iter().any(|s| hash.starts_with(s.as_str())) {
+        return;
+    }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -683,6 +704,25 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 }
 
 /// Validates an emitted shader if asked to.
+/// The shaders host pipelines are being made for, by thread (`--pipelines`).
+static BUILDING: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+
+/// For crash reports: one line per pipeline being made, the faulting
+/// thread's marked. Never waits.
+fn building() -> String {
+    let Ok(building) = BUILDING.try_lock() else {
+        return "  pipelines being made: not known (the list was in use)\n".to_owned();
+    };
+    let here = std::thread::current().id();
+    building
+        .iter()
+        .map(|(thread, label)| {
+            let mark = if *thread == here { " (this thread)" } else { "" };
+            format!("  pipeline being made{mark}: {label}\n")
+        })
+        .collect()
+}
+
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
@@ -706,12 +746,15 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        let thread = std::thread::current().id();
+        lock(&BUILDING).push((thread, label()));
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
+        lock(&BUILDING).retain(|(t, _)| *t != thread);
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;

@@ -875,6 +875,14 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// For crash reports: the host pipelines being made at that moment, one
+/// line each, with the shaders, thread and cache key (`make::being_made`).
+/// Never blocks.
+#[cfg(windows)]
+pub fn being_made() -> String {
+    make::being_made()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]

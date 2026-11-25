@@ -108,6 +108,26 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// What other crates add to an unhandled-exception report (what they were
+/// doing when it came): called on the faulting thread, so each must not
+/// wait for a lock and returns whole lines.
+static CONTEXT: std::sync::Mutex<Vec<fn() -> String>> = std::sync::Mutex::new(Vec::new());
+
+/// Adds `lines` to every later unhandled-exception report. Call once per
+/// source; `lines` runs inside the crash handler, so it must not block.
+pub fn add_crash_context(lines: fn() -> String) {
+    CONTEXT.lock().unwrap_or_else(|e| e.into_inner()).push(lines);
+}
+
+/// The added lines; nothing if another thread holds the list (only while
+/// a source is being added).
+fn crash_context() -> String {
+    let Ok(sources) = CONTEXT.try_lock() else {
+        return String::new();
+    };
+    sources.iter().map(|lines| lines()).collect()
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -510,7 +530,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let said = title_output();
+        let said = crash_context() + &title_output();
         eprint!("{said}");
         text.push_str(&said);
         append_to_log(&text);
