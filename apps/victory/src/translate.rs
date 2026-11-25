@@ -413,6 +413,8 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let completed = AtomicUsize::new(0);
+    let last_interval = AtomicUsize::new(0);
     let started = std::time::Instant::now();
     let time_is_up = || limit.is_some_and(|n| started.elapsed().as_secs() >= n);
     'scan: for root in &paths {
@@ -453,14 +455,24 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
                             let compute = pipelines && stage == "compute";
                             let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
                             let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            count.fetch_add(1, Ordering::Relaxed);
                             match pipeline {
                                 Some(true) => made.fetch_add(1, Ordering::Relaxed),
                                 Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
                                 None => 0,
                             };
-                            if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
+                            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            let elapsed = started.elapsed().as_secs();
+                            let interval = (elapsed / 15) as usize;
+                            let periodic =
+                                last_interval.fetch_max(interval, Ordering::Relaxed) < interval;
+                            if n.is_multiple_of(2000) || periodic {
+                                let translated = done.load(Ordering::Relaxed);
+                                let checked = translated + refused.load(Ordering::Relaxed);
+                                let pipelines = made.load(Ordering::Relaxed);
+                                println!(
+                                    "progress {elapsed} s  {checked} shaders checked  {translated} translated  {pipelines} compute pipelines"
+                                );
                             }
                         }
                     });
