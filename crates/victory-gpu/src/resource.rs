@@ -3025,6 +3025,9 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    #[cfg(windows)]
+    mod output_merger;
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
