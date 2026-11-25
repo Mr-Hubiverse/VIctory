@@ -1531,6 +1531,11 @@ mod difference_tests {
                 if (r & 0xF0) == 0x20 {
                     title[k] = title[k].wrapping_add(5);
                 }
+                if (r & 0x07) == 0 {
+                    // Overlapping conflict: GPU and CPU write different values to the same byte (GPU wins).
+                    now[k] = held[k].wrapping_add(11);
+                    title[k] = held[k].wrapping_add(29);
+                }
             }
             let (mut h1, mut t1) = (held.clone(), title.clone());
             let (mut h2, mut t2) = (held.clone(), title.clone());
