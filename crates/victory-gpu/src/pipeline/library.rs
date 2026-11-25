@@ -57,6 +57,34 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// AMD's D3D12 compiler has crashed inside `CreateComputePipelineState`
+/// while several early pipelines were being made together. Keep parallel
+/// shader translation, but enter the AMD driver's PSO creation path one at a
+/// time; other vendors retain the existing parallel compilation path.
+static AMD_PSO_CREATION: Mutex<()> = Mutex::new(());
+static AMD_ADAPTER: OnceLock<bool> = OnceLock::new();
+
+fn amd_adapter() -> bool {
+    *AMD_ADAPTER.get_or_init(|| {
+        let amd = crate::host::host().is_some_and(|host| host.is_amd());
+        if amd {
+            tracing::info!("serializing host pipeline creation on AMD D3D12");
+        }
+        amd
+    })
+}
+
+fn create_pso<T>(serialize: bool, create: impl FnOnce() -> T) -> T {
+    if serialize {
+        let _creation = AMD_PSO_CREATION
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        create()
+    } else {
+        create()
+    }
+}
+
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
@@ -568,10 +596,13 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compile outside the pipeline-library lock: on AMD, only the driver's
+    // PSO creation call is serialized to avoid its concurrent compiler crash.
     let pso = {
-        let _call = call("make", name);
-        create()?
+        create_pso(amd_adapter(), || {
+            let _call = call("make", name);
+            create()
+        })?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -766,6 +797,38 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_pipeline_creation_is_serialized_across_workers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 8;
+        let gate = Arc::new(Barrier::new(WORKERS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let gate = gate.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    create_pso(true, || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

@@ -1422,7 +1422,8 @@ pub(crate) fn host_made<'a>(
         return None;
     }
     let (host, _) = hosted(this, false)?;
-    // SAFETY: as in `host_resource`.
+    // SAFETY: the idle grace used by `host_resource` also protects this
+    // borrowed diagnostic read.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
@@ -1800,14 +1801,13 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
 /// address is what views and lists name.
-/// shortcut: [`host_resource`] hands out the host texture without holding
-/// it; a thread that asked for it and has not yet recorded its use (which
-/// makes the list or the slot hold it) is protected by that idle time alone.
-/// Every caller uses it at once, within the title's call.
+/// `host_resource` returns a borrowed interface rather than a pin. Under
+/// pressure, the sweep skips the slow frame gate but keeps a 250 ms grace so
+/// the caller can finish recording and the list or slot can pin it.
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(force: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1832,7 +1832,12 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::resource_idle_expired(
+                    r.host.used.load(Relaxed),
+                    idle_ms,
+                    IDLE_FRAMES,
+                    force,
+                )
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1909,7 +1914,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
         let placed = r.host.placed.load(Relaxed);
         // Its first page: what is there of a texture starts there.
         let unmapped = placed && !crate::texture::committed(r.data().cast_const(), 1);
-        let idle = crate::host::long_ago(r.host.used.load(Relaxed), 30_000, 60)
+        let idle = crate::host::idle_expired(r.host.used.load(Relaxed), 30_000, 60, false)
             && std::sync::Arc::strong_count(host) == 1
             && crate::host::references(&host.texture) == 1;
         if unmapped {
@@ -2067,8 +2072,8 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
-/// this is the texture's first use ([`Hosted`]). Asking is a use; what must
-/// not count as one asks `host_made`.
+/// this is the texture's first use ([`Hosted`]). Asking is a use; diagnostics
+/// that must not count as one ask `host_made`.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,
@@ -2079,9 +2084,7 @@ pub(crate) fn host_resource<'a>(
     let (host, _) = hosted(this, true)?;
     // SAFETY: the resource holds the host copy until the title releases it
     // (lists and slots that name the texture hold it past that), or until
-    // `let_go_idle` takes it: only from a texture the title fills, that no
-    // list and no slot holds and that nothing asked for in seconds (the
-    // asking just made is noted under the same lock).
+    // `let_go_idle` takes it after the idle gates.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 

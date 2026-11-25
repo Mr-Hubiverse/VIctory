@@ -1645,7 +1645,7 @@ impl HostHeap {
             }
             let starts: Vec<u64> = waiting
                 .iter()
-                .filter(|&(_, &since)| crate::host::long_ago(since, 1000, 2))
+                .filter(|&(_, &since)| crate::host::idle_expired(since, 1000, 2, false))
                 .map(|(&start, _)| start)
                 .take(Self::WAITING_A_PASS)
                 .collect();

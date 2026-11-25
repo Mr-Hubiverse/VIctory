@@ -2764,7 +2764,12 @@ pub(crate) fn let_go_idle(force: bool) {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && (force || crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES))
+                    && crate::host::idle_expired(
+                        s.used.load(Ordering::Relaxed),
+                        idle_ms,
+                        IDLE_FRAMES,
+                        force,
+                    )
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)

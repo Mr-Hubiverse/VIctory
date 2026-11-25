@@ -104,7 +104,7 @@ pub(crate) fn now_ms() -> u64 {
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// This moment, for telling later how long ago it was ([`long_ago`]): the
+/// This moment, for telling later how long ago it was ([`idle_expired`]): the
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
@@ -116,10 +116,45 @@ pub(crate) fn moment() -> u64 {
 /// back. Both: at seconds per frame, what every frame uses is not touched
 /// for seconds, and at many frames per second not for many frames. (A title
 /// that never waits for frames has no frame count: nothing is then idle.)
-pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
-    let now = self::moment();
+fn long_ago_at(moment: u64, now: u64, ms: u64, frames: u64) -> bool {
     let tenths = (now & 0xffff_ffff).saturating_sub(moment & 0xffff_ffff);
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
+}
+
+pub(crate) fn idle_expired_at(
+    moment: u64,
+    now: u64,
+    ms: u64,
+    frames: u64,
+    force: bool,
+) -> bool {
+    force || long_ago_at(moment, now, ms, frames)
+}
+
+pub(crate) fn idle_expired(moment: u64, ms: u64, frames: u64, force: bool) -> bool {
+    idle_expired_at(moment, self::moment(), ms, frames, force)
+}
+
+fn resource_idle_expired_at(
+    moment: u64,
+    now: u64,
+    ms: u64,
+    frames: u64,
+    force: bool,
+) -> bool {
+    if force {
+        // `host_resource` returns a borrowed COM interface. Keep a short
+        // handoff grace for the caller to finish recording and let its list
+        // or descriptor pin the resource, but do not wait on frame progress.
+        const BORROW_GRACE_MS: u64 = 250;
+        long_ago_at(moment, now, BORROW_GRACE_MS, 0)
+    } else {
+        long_ago_at(moment, now, ms, frames)
+    }
+}
+
+pub(crate) fn resource_idle_expired(moment: u64, ms: u64, frames: u64, force: bool) -> bool {
+    resource_idle_expired_at(moment, self::moment(), ms, frames, force)
 }
 
 /// Available physical RAM and process commit headroom in bytes, from
@@ -290,9 +325,9 @@ fn sweep() {
     crate::pipeline::trim_library(force);
     crate::shadow::let_go_idle(force);
     crate::texture::let_go_idle(force);
-    // `host_resource` returns a borrowed COM pointer rather than an Arc; its
-    // idle window protects the interval before a list or slot pins it.
-    crate::resource::let_go_idle();
+    // `host_resource` returns a borrowed COM pointer rather than an Arc; the
+    // texture sweep keeps its short handoff grace before taking that copy.
+    crate::resource::let_go_idle(force);
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -832,6 +867,18 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+impl Host {
+    /// Whether the host device is backed by AMD's D3D12 driver.
+    pub(crate) fn is_amd(&self) -> bool {
+        self.adapter
+            .as_ref()
+            .and_then(|adapter| adapter.cast::<IDXGIAdapter1>().ok())
+            // SAFETY: a plain adapter query.
+            .and_then(|adapter| unsafe { adapter.GetDesc1().ok() })
+            .is_some_and(|desc| desc.VendorId == 0x1002)
     }
 }
 
@@ -10772,6 +10819,26 @@ void main() {
         assert!(!force_sweep(Some(2 * gib), false));
         assert!(!force_sweep(None, false));
         assert!(force_sweep(None, true));
+    }
+
+    #[test]
+    fn commit_pressure_does_not_wait_for_slow_frame_advances() {
+        use super::{force_sweep, idle_expired_at, long_ago_at, resource_idle_expired_at};
+        let mib = 1024 * 1024;
+        let used = (12u64 << 32) | 100;
+        // At 0.2 frames per second, four frame advances take about 20 s.
+        // Simulate one frame after 5.2 s: the normal four-frame gate stays
+        // closed, while the resource cache's 250 ms handoff grace has elapsed.
+        let now = (13u64 << 32) | 152;
+        assert!(!long_ago_at(used, now, 250, 4));
+
+        let force = force_sweep(Some(903 * mib), false);
+        assert!(idle_expired_at(used, now, 250, 4, force));
+        assert!(resource_idle_expired_at(used, now, 10_000, 4, force));
+
+        // A just-returned borrowed interface still gets the handoff grace.
+        let too_soon = (13u64 << 32) | 101;
+        assert!(!resource_idle_expired_at(used, too_soon, 10_000, 4, force));
     }
 
     #[test]

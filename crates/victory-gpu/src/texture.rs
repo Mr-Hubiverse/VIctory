@@ -570,7 +570,7 @@ pub(crate) fn let_go_idle(force: bool) {
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || (!force && !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES));
+            || !crate::host::idle_expired(s.used.load(Relaxed), idle_ms, IDLE_FRAMES, force);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -764,7 +764,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     // still holds the level's bytes.
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
-        if since != 0 && crate::host::long_ago(since, 1000, 2) {
+        if since != 0 && crate::host::idle_expired(since, 1000, 2, false) {
             if crate::resource::room_lately() {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
