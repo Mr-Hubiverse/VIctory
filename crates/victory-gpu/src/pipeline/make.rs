@@ -45,6 +45,8 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// A pass over the screen ([`GraphicsState::screen_pass`]).
+    screen: bool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -111,6 +113,7 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let left_out = left_out(&shaders);
+        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
             shaders,
             graphics,
@@ -120,6 +123,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            screen,
         }
     }
 
@@ -199,6 +203,28 @@ fn wait_budget() -> Duration {
 /// 0007). Only a pipeline still not made after its frame's window loses
 /// that frame's draws. `VICTORY_PIPELINE_WAIT_MS=500` waits as before.
 const DEFAULT_WAIT_MS: u64 = 12_000;
+
+/// As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`,
+/// 10,000): such a pass is a screen of a kind the title runs once, to fill
+/// its lighting tables; behind a world's worth of pipelines it was dropped
+/// and the run had no lamps and no diffuse light to its end (run
+/// textures-d2; Belobug 18e57db8 found the same). A budget of their own,
+/// and workers, keep them.
+fn screen_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Whether passes over the screen go before the others.
+fn screens_first() -> bool {
+    !screen_budget().is_zero()
+}
 
 /// The title's GPU watchdog: one frame of more than this ends the run.
 const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
@@ -418,20 +444,26 @@ impl FrameWait {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let base = wait_budget();
+    let screen = p.screen && screens_first();
+    let base = if screen { screen_budget() } else { wait_budget() };
     if base.is_zero() || p.slow() {
         return;
     }
     // What was waited past the base budget since the start, in
-    // milliseconds, by kind (others, compute).
-    static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    // milliseconds, by kind (others, compute, pass over the screen).
+    static PAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
     let compute = p.computes();
-    let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
+    let lane = if screen { 2 } else { usize::from(compute) };
+    let past = &PAST[lane];
+    let budget = if screen {
+        base
+    } else {
+        frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)))
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now), by kind.
-    static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
-    let frame_wait = &FRAMES[usize::from(compute)];
+    static FRAMES: [Mutex<FrameWait>; 3] = [const { Mutex::new(FrameWait::new()) }; 3];
+    let frame_wait = &FRAMES[lane];
     let sharing = shared_budget();
     let started = Instant::now();
     let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
@@ -451,6 +483,14 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if screen && waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>().join(","),
+            "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
+        );
+    }
     past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
     frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
     crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
@@ -467,6 +507,9 @@ const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
 struct Queue {
+    /// Requested passes over the screen: before all others, and the only ones
+    /// [`SCREEN_WORKERS`] take.
+    screen: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     early_depth: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
@@ -475,6 +518,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            screen: VecDeque::new(),
             early: VecDeque::new(),
             early_depth: VecDeque::new(),
             requested: VecDeque::new(),
@@ -489,7 +533,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen && screens_first() {
+            self.screen.push_back(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if p.graphics.as_ref().is_some_and(|state| state.writes_depth_only()) {
             // Shadow maps and depth prepasses supply several later draws. Rebuild
@@ -501,12 +547,16 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early_depth.pop_front().or_else(|| self.early.pop_front()))
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    fn pop(&mut self, screens_only: bool) -> Option<Arc<Pending>> {
+        let mut p = self.screen.pop_front();
+        if p.is_none() && !screens_only {
+            p = self.requested.pop_front().or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early_depth.pop_front().or_else(|| self.early.pop_front()))
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            });
+        }
+        let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -532,14 +582,21 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        if p.screen {
+            AVAILABLE.notify_all();
+        } else {
+            AVAILABLE.notify_one();
+        }
     }
 }
 
-fn next() -> Arc<Pending> {
+/// Workers that make passes over the screen alone, besides the others.
+const SCREEN_WORKERS: usize = 2;
+
+fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(screens_only) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -552,18 +609,21 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        for i in 0..workers + screens {
+            let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                .spawn(move || {
+                    // Below the title's own threads (loading, recording); the
+                    // screen workers keep it too (their queues are few).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(screens_only).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -734,11 +794,11 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
     }
 
     #[test]
@@ -760,8 +820,26 @@ mod tests {
         }
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         for expected in [&promoted, &shadow, &normal] {
-            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+            assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), expected));
         }
-        assert!(queue.pop().is_none());
+        assert!(queue.pop(false).is_none());
+    }
+
+    /// Passes over the screen go before all others, and workers of their own
+    /// take nothing else.
+    #[test]
+    fn passes_over_the_screen_go_first() {
+        let of = |screen| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = screen;
+            Arc::new(p)
+        };
+        let (world, screen) = (of(false), of(true));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&world, REQUESTED), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &screen));
+        assert!(queue.pop(true).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &world));
     }
 }

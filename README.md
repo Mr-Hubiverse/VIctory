@@ -76,6 +76,8 @@ time a frame saved on the test machine).
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
+The on/off switches below (`...=1`) are off when unset or set to `0`.
+
 Further switches carried from victory-fork:
 
 | Switch | Effect |
