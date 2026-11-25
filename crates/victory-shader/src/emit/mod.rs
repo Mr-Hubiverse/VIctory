@@ -337,10 +337,11 @@ pub struct HostShader {
 }
 
 impl HostShader {
-    /// The fixed wave size declared in the emitted DXIL, if any.
-    pub fn fixed_wave_size(&self) -> Option<u32> {
+    /// The fixed wave size declared in the emitted DXIL if it is outside the device's range.
+    pub fn incompatible_wave_size(&self, supported: &std::ops::RangeInclusive<u32>) -> Option<u32> {
         let container = Container::parse(&self.dxil).ok()?;
         container::fixed_wave_size(container.part(FourCC::PSV0)?.data)
+            .filter(|n| !supported.contains(n))
     }
 
     /// Size of the user-data buffer the shader declares, in dwords (a

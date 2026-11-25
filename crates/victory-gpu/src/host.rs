@@ -43,6 +43,7 @@ static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) wave_lanes: Option<std::ops::RangeInclusive<u32>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -674,12 +675,14 @@ fn create() -> windows::core::Result<Host> {
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if device
+        let wave_lanes = device
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
-        {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            .then_some(o1.WaveLaneCountMin..=o1.WaveLaneCountMax)
+            .filter(|lanes| *lanes.start() != 0 && !lanes.is_empty());
+        if let Some(lanes) = &wave_lanes {
+            tracing::info!(min = lanes.start(), max = lanes.end(), "host wave lanes");
+            victory_shader::emit::set_host_max_wave(*lanes.end());
         }
         // Whether the card's own memory can be mapped by the CPU ("GPU
         // upload heaps": the card's memory through a resizable BAR). With
@@ -729,6 +732,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),

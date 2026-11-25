@@ -436,13 +436,17 @@ impl HostPipeline {
         }
         let host = host()?;
         if let Some(cs) = compute
-            && let Some(required) = cs.translated()?.host.fixed_wave_size()
+            && let Some(lanes) = &host.wave_lanes
+            && let Some(required) = cs.translated()?.host.incompatible_wave_size(lanes)
         {
-            let max = victory_shader::emit::host_max_wave();
-            if max != 0 && required > max {
-                tracing::warn!(?shaders, required, max, "host compute pipeline requires more wave lanes than the adapter supports");
-                return None;
-            }
+            tracing::warn!(
+                ?shaders,
+                required,
+                min = lanes.start(),
+                max = lanes.end(),
+                "host compute pipeline requires a wave size outside the adapter range"
+            );
+            return None;
         }
 
         // The root signature the translated shaders' bindings define.

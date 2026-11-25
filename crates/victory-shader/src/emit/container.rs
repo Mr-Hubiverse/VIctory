@@ -437,6 +437,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn fixed_wave_size_is_checked_against_both_device_limits() {
+        let psv = psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [32, 1, 1],
+            wave_size: Some(32),
+        });
+        let shader = super::super::HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: build(&[(b"PSV0", &psv)]),
+            ..super::super::host::stub_ps()
+        };
+        assert_eq!(shader.incompatible_wave_size(&(32..=32)), None);
+        assert_eq!(shader.incompatible_wave_size(&(32..=64)), None);
+        assert_eq!(shader.incompatible_wave_size(&(64..=64)), Some(32));
+        assert_eq!(shader.incompatible_wave_size(&(16..=16)), Some(32));
+    }
+
+    #[test]
     fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
         let integer = SigElement {
             name: "TEXCOORD".into(),
