@@ -70,7 +70,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
+pub use victory_gpu::pipeline::{check_preload_device, save_pipeline_cache, warm};
 
 /// Detect the adapter settings used by the runtime shader cache.
 pub fn prepare_shader_warmup() -> Result<(), String> {

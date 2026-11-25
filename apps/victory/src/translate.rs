@@ -405,6 +405,9 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
     victory_hle::modules::d3d12x::prepare_shader_warmup().map_err(anyhow::Error::msg)?;
     let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let paths = crate::default_paths(paths)?;
+    if pipelines {
+        victory_hle::modules::d3d12x::check_preload_device()?;
+    }
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));

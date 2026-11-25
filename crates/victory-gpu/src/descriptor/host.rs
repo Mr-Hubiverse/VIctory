@@ -944,17 +944,50 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the feature query fills this structure.
+        let tier = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .is_ok()
+        .then_some(caps.ResourceBindingTier);
+        let mut limits = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query fills this structure on runtimes that support it.
+        let max_views = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut limits).cast(),
+                size_of_val(&limits) as u32,
+            )
+        }
+        .is_ok()
+        .then_some(limits.MaxViewDescriptorHeapSize)
+        .filter(|&count| count >= PORTABLE_VIEWS);
+        let views = view_heap_size(tier, max_views, fits);
         tracing::info!(
             views,
+            binding_tier = ?tier,
+            ?max_views,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
+}
+
+fn view_heap_size(
+    tier: Option<D3D12_RESOURCE_BINDING_TIER>,
+    max_views: Option<u32>,
+    fits: impl FnOnce(u32) -> bool,
+) -> u32 {
+    let desired = max_views.unwrap_or(UNCAPPED_VIEWS).min(UNCAPPED_VIEWS);
+    if tier == Some(D3D12_RESOURCE_BINDING_TIER_3) && desired > PORTABLE_VIEWS && fits(desired) {
+        return desired;
+    }
+    PORTABLE_VIEWS
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
@@ -4200,6 +4233,22 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shader_visible_heap_probe_respects_the_reported_limits() {
+        fn unexpected(_: u32) -> bool {
+            panic!("unsupported heap size was probed");
+        }
+        for tier in [None, Some(D3D12_RESOURCE_BINDING_TIER_1), Some(D3D12_RESOURCE_BINDING_TIER_2)] {
+            assert_eq!(view_heap_size(tier, None, unexpected), PORTABLE_VIEWS);
+        }
+        let tier = Some(D3D12_RESOURCE_BINDING_TIER_3);
+        assert_eq!(view_heap_size(tier, Some(PORTABLE_VIEWS), unexpected), PORTABLE_VIEWS);
+        let limit = 1_500_000;
+        assert_eq!(view_heap_size(tier, Some(limit), |count| count == limit), limit);
+        assert_eq!(view_heap_size(tier, None, |count| count == UNCAPPED_VIEWS), UNCAPPED_VIEWS);
+        assert_eq!(view_heap_size(tier, None, |_| false), PORTABLE_VIEWS);
+    }
 
     #[test]
     fn texture_remaps_visit_each_changed_region_once() {
