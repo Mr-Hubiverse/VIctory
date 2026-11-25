@@ -163,6 +163,18 @@ pub(crate) struct Psv<'a> {
     pub wave_size: Option<u32>,
 }
 
+/// The minimum and maximum wave lane counts in PSV runtime info.
+const PSV_WAVE_LANES: std::ops::Range<usize> = 16..24;
+
+pub(super) fn fixed_wave_size(psv: &[u8]) -> Option<u32> {
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    let lanes = info.get(PSV_WAVE_LANES)?;
+    let min = u32::from_le_bytes(lanes[..4].try_into().ok()?);
+    let max = u32::from_le_bytes(lanes[4..].try_into().ok()?);
+    (min != 0 && min == max).then_some(min)
+}
+
 /// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
@@ -192,8 +204,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         );
     }
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
-    info[16..20].copy_from_slice(&min.to_le_bytes());
-    info[20..24].copy_from_slice(&max.to_le_bytes());
+    let (min_lanes, max_lanes) = info[PSV_WAVE_LANES].split_at_mut(4);
+    min_lanes.copy_from_slice(&min.to_le_bytes());
+    max_lanes.copy_from_slice(&max.to_le_bytes());
     info[24] = p.stage;
     for (k, n) in p.threads.into_iter().enumerate() {
         info[36 + 4 * k..40 + 4 * k].copy_from_slice(&n.to_le_bytes());
@@ -399,6 +412,83 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_wave_size_requires_matching_lanes_in_complete_runtime_info() {
+        let mut p = Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [64, 1, 1],
+            wave_size: None,
+        };
+        assert_eq!(fixed_wave_size(&psv(&p)), None);
+        for lanes in [32, 64] {
+            p.wave_size = Some(lanes);
+            let data = psv(&p);
+            assert_eq!(fixed_wave_size(&data), Some(lanes));
+            assert_eq!(fixed_wave_size(&data[..51]), None);
+        }
+    }
+
+    #[test]
+    fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
+        let integer = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let flat_float = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            comp: 9,
+            col: 0,
+            ..integer.clone()
+        };
+        let smooth_float = SigElement {
+            index: 2,
+            row: Some(1),
+            interp: 2,
+            comp: 9,
+            ..integer.clone()
+        };
+        let outputs = [integer, flat_float, smooth_float];
+        let mut recovered = super::super::signature(&signature(&outputs, false)).unwrap();
+        // DXC orders the row by semantic-name offset even though TEXCOORD
+        // occupies z/w and COLOR occupies x/y.
+        assert_eq!(recovered[0].name, "TEXCOORD");
+        assert_eq!(recovered[1].name, "COLOR");
+        // PSV records can be in a different order again.
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        recovered[1].interp = 2;
+        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
+        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+            .is_err());
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
