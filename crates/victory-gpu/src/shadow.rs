@@ -2883,8 +2883,18 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        if let Some((address, len)) = self.refresh_params(address, len) {
+            list.defer_refresh(self, address, len);
+        }
+    }
+
+    /// The range [`Shadow::refresh`] would bring up to date, for callers that
+    /// collect several buffers and defer them under one lock.
+    pub(crate) fn refresh_params(&self, address: u64, len: u64) -> Option<(usize, usize)> {
+        Some((
+            address as usize,
+            len.min(self.start + self.len - address) as usize,
+        ))
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {

@@ -913,6 +913,97 @@ mod tests {
             new[new.len() / 2]
         );
     }
+
+    /// Batching must leave the same steps, in the same order, as one call per
+    /// range (including deduplication of repeated ranges).
+    #[test]
+    fn defer_refreshes_matches_one_call_per_range() {
+        let Some(host) = host() else { return };
+        let Ok(one) = host.new_list() else { return };
+        let Ok(batched) = host.new_list() else { return };
+        static DATA: [u8; 0x300] = [0; 0x300];
+        let address = DATA.as_ptr() as u64;
+        const ID: usize = 0x52454231;
+        crate::shadow::register(ID, address, DATA.len() as u64);
+        let Some(shadow) = crate::shadow::find(address, DATA.len() as u64) else {
+            crate::shadow::unregister(ID, address);
+            return;
+        };
+        let ranges = [
+            (shadow.clone(), address as usize, 0x100usize),
+            (shadow.clone(), address as usize + 0x100, 0x100),
+            (shadow.clone(), address as usize, 0x100),
+        ];
+        for (shadow, address, len) in &ranges {
+            one.defer_refresh(shadow, *address, *len);
+        }
+        batched.defer_refreshes(&ranges);
+        let one = one.deferred();
+        let batched = batched.deferred();
+        assert_eq!(one.copies.len(), 2);
+        assert_eq!(batched.copies.len(), 2);
+        for (a, b) in one.copies.iter().zip(&batched.copies) {
+            let (Step::Refresh(a, aa, al), Step::Refresh(b, ba, bl)) = (a, b) else {
+                panic!("only refreshes were deferred");
+            };
+            assert_eq!(std::sync::Arc::as_ptr(a), std::sync::Arc::as_ptr(b));
+            assert_eq!((aa, al), (ba, bl));
+        }
+        drop(one);
+        drop(batched);
+        crate::shadow::unregister(ID, address);
+    }
+
+    /// CPU-only A/B of deferring the buffers of one draw: one lock for all
+    /// ranges against one lock per range. Run with
+    /// `cargo test --release -p victory-gpu defer_refresh_batching -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn defer_refresh_batching() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        static DATA: [u8; 0x800] = [0; 0x800];
+        let address = DATA.as_ptr() as u64;
+        const ID: usize = 0x52454232;
+        crate::shadow::register(ID, address, DATA.len() as u64);
+        let Some(shadow) = crate::shadow::find(address, DATA.len() as u64) else {
+            crate::shadow::unregister(ID, address);
+            return;
+        };
+        const BUFFERS: usize = 8;
+        const ROUNDS: usize = 50_000;
+        let ranges: Vec<_> = (0..BUFFERS)
+            .map(|i| (shadow.clone(), address as usize + i * 0x100, 0x100))
+            .collect();
+
+        let mut samples = Vec::new();
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                for (s, address, len) in &ranges {
+                    list.defer_refresh(s, *address, *len);
+                }
+            }
+            let one_each = started.elapsed().as_secs_f64() * 1e9 / (ROUNDS * BUFFERS) as f64;
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                list.defer_refreshes(&ranges);
+            }
+            let batched = started.elapsed().as_secs_f64() * 1e9 / (ROUNDS * BUFFERS) as f64;
+            println!("sample {sample}: one each {one_each:.1} ns, batched {batched:.1} ns");
+            samples.push((one_each, batched));
+        }
+        let mut old: Vec<f64> = samples.iter().map(|s| s.0).collect();
+        let mut new: Vec<f64> = samples.iter().map(|s| s.1).collect();
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        println!(
+            "median per range: one each {:.1} ns, batched {:.1} ns",
+            old[old.len() / 2],
+            new[new.len() / 2]
+        );
+        crate::shadow::unregister(ID, address);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -7326,12 +7417,23 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.defer_refreshes(&[(shadow.clone(), address, len)]);
+    }
+
+    /// Brings several ranges up to date when the list is submitted, taking
+    /// the deferred lock once however many buffers a draw uses.
+    pub(crate) fn defer_refreshes(
+        &self,
+        refreshes: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+        for (shadow, address, len) in refreshes {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), *address, *len));
+            }
         }
     }
 
