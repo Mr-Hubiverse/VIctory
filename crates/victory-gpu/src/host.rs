@@ -721,16 +721,50 @@ fn create() -> windows::core::Result<Host> {
     // is made (`VICTORY_RENDERDOC`).
     #[cfg(feature = "diagnostics")]
     crate::renderdoc::load();
+    let agility = match victory_shader::emit::agility::load() {
+        Ok(Some(factory)) => {
+            tracing::info!(
+                version = factory.version(),
+                path = %factory.core_path().display(),
+                "using Direct3D 12 Agility SDK",
+            );
+            Some(factory)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Direct3D 12 Agility SDK unavailable; falling back to system d3d12.dll",
+            );
+            None
+        }
+    };
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
         let debug =
             cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
-            let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
+            let layer: Option<ID3D12Debug> = if let Some(factory) = agility {
+                match factory.configuration_interface(&CLSID_D3D12Debug) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no D3D12 debug layer");
+                        None
+                    }
+                }
+            } else {
+                let mut out: Option<ID3D12Debug> = None;
+                match D3D12GetDebugInterface(&mut out) {
+                    Ok(()) => out,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no D3D12 debug layer");
+                        None
+                    }
+                }
+            };
+            if let Some(l) = &layer {
+                l.EnableDebugLayer();
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
@@ -753,26 +787,41 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
         if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
+            let dred: Option<ID3D12DeviceRemovedExtendedDataSettings> =
+                if let Some(factory) = agility {
+                    factory
+                        .configuration_interface(&CLSID_D3D12DeviceRemovedExtendedData)
+                        .ok()
+                } else {
+                    let mut out: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+                    D3D12GetDebugInterface(&mut out).ok().and(out)
+                };
+            if let Some(dred) = dred {
                 dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if on_warp() {
+        let device = if on_warp() {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = if let Some(factory) = agility {
+                factory.create_device(&adapter, D3D_FEATURE_LEVEL_12_0)?
+            } else {
+                let mut out: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut out)?;
+                out.ok_or_else(windows::core::Error::empty)?
+            };
             tracing::info!("host device on the software adapter (WARP)");
+            device
+        } else if let Some(factory) = agility {
+            factory.create_device(None, D3D_FEATURE_LEVEL_12_0)?
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+            let mut out: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut out)?;
+            out.ok_or_else(windows::core::Error::empty)?
+        };
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.

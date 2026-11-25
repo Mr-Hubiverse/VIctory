@@ -91,6 +91,8 @@ mod helper_lane_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
+pub mod agility;
+#[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod own_bits;

@@ -86,24 +86,35 @@ impl Host {
     /// the adapter `VICTORY_ADAPTER` names (a part of its description).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let agility = super::agility::load()?;
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
             // refused pipeline's error then carries.
             if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
-                let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
-                    && let Some(debug) = debug
-                {
+                let debug: Option<ID3D12Debug> = if let Some(factory) = agility {
+                    factory.configuration_interface(&CLSID_D3D12Debug).ok()
+                } else {
+                    let mut out: Option<ID3D12Debug> = None;
+                    D3D12GetDebugInterface(&mut out).ok().and(out)
+                };
+                if let Some(debug) = debug {
                     debug.EnableDebugLayer();
                 }
             }
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
+            let device = if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                if let Some(agility) = agility {
+                    agility
+                        .create_device(&adapter, D3D_FEATURE_LEVEL_12_0)
+                        .map_err(err)?
+                } else {
+                    let mut out: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut out).map_err(err)?;
+                    out.ok_or("no device")?
+                }
             } else if let Some(want) = std::env::var("VICTORY_ADAPTER")
                 .ok()
                 .filter(|v| !v.is_empty())
@@ -117,6 +128,7 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let mut seen = Vec::new();
                 let mut i = 0;
+                let mut out: Option<ID3D12Device> = None;
                 while let Ok(adapter) = factory.EnumAdapters1(i) {
                     i += 1;
                     let desc = adapter.GetDesc1().map_err(err)?;
@@ -128,37 +140,43 @@ impl Host {
                     let name = String::from_utf16_lossy(&desc.Description[..end]);
                     if name.to_lowercase().contains(&want) {
                         eprintln!("VICTORY_ADAPTER: {name}");
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
+                        out = Some(if let Some(agility) = agility {
+                            agility
+                                .create_device(&adapter, D3D_FEATURE_LEVEL_12_0)
+                                .map_err(err)?
+                        } else {
+                            let mut made: Option<ID3D12Device> = None;
+                            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut made)
+                                .map_err(err)?;
+                            made.ok_or("no device")?
+                        });
                         break;
                     }
                     seen.push(name);
                 }
-                if device.is_none() {
-                    return Err(format!(
-                        "VICTORY_ADAPTER={want} matches none of: {}",
-                        seen.join(", ")
-                    ));
-                }
+                out.ok_or_else(|| {
+                    format!("VICTORY_ADAPTER={want} matches none of: {}", seen.join(", "))
+                })?
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let device = if let Some(agility) = agility {
+                    agility
+                        .create_device(None, D3D_FEATURE_LEVEL_12_0)
+                        .map_err(err)?
+                } else {
+                    let mut out: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut out).map_err(err)?;
+                    out.ok_or("no device")?
+                };
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
                 // device): that is no hardware device, and the tests that
                 // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                    {
-                        return Err("the default device is the software adapter".to_owned());
-                    }
+                if software(&device) {
+                    return Err("the default device is the software adapter".to_owned());
                 }
-            }
-            let device = device.ok_or("no device")?;
+                device
+            };
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -300,8 +318,13 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            super::agility::serialize_versioned_root_signature(
+                &self.device,
+                &desc,
+                &mut blob,
+                Some(&mut error),
+            )
+            .map_err(err)?;
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),

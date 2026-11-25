@@ -41,6 +41,8 @@ cargo build --release -p victory
 
 ## Play
 
+On Windows 10 (build 19041+), the in-box `d3d12.dll` stops at Shader Model 6.5. To enable Shader Model 6.6 and directly indexed descriptor heaps without modifying the binaries, place `D3D12Core.dll` from Microsoft's DirectX 12 Agility SDK (`Microsoft.Direct3D.D3D12`) at `D3D12\D3D12Core.dll` beside the executable, or point `VICTORY_D3D12_AGILITY` to the DLL, its directory, or an unpacked NuGet package root. On Windows 11 or when neither is present, the system Direct3D 12 runtime is used unchanged.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
