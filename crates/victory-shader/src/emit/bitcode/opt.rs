@@ -224,14 +224,18 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 && !self.blocks.is_empty() {
+            let effects = self.effects();
+            let mut tree = None;
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
             for _ in 0..4 {
-                let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
-                    changed |= self.prune();
+                let analysis = tree.get_or_insert_with(|| self.dominator_tree());
+                let mut changed = self.merge(passes, &effects, analysis);
+                if passes & FOLD != 0 && self.prune() {
+                    tree = None;
+                    changed = true;
                 }
                 if !changed {
                     break;
@@ -671,12 +675,7 @@ impl Module {
 
     /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
     /// dominator tree. Returns whether anything changed.
-    fn merge(&mut self, passes: u32) -> bool {
-        if self.blocks.is_empty() {
-            return false;
-        }
-        let effects = self.effects();
-        let tree = self.dominator_tree();
+    fn merge(&mut self, passes: u32, effects: &[Effect], tree: &Tree) -> bool {
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -813,7 +812,7 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i);
+                let class = self.class(effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
