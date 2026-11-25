@@ -44,49 +44,6 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 ```
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
-### Newest (2026-11-25, later the same day)
-
-Memory sync between the title's memory and the copies on the card:
-- **A write through one view of a physical page is seen by the copies taken
-  through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title
-  shows one page at several addresses and a copy was guarded at one of them
-  only. Measured on the test machine: 0.8 to 1.0 million such writes in a
-  five-minute run, every one of which used to leave a copy stale. Since it
-  went in, the first room had its walls in the later frames of 4 runs out of
-  4 (2 of 5 before); the room's very first shot still comes up without walls
-  in some runs.
-- Kernel reads into title memory are read beside and copied in, so a block
-  guarded again in between no longer fails the read.
-- Writes of the storage layer into physical pages are counted where the title
-  has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
-  them in every run) and can open the guards there:
-  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
-- Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
-
-Card memory (the test card is full from the first frame of the world: 85 to
-99 % of its budget for a whole run, about 26,000 texture copies let go and
-3,400 made again in five minutes, 2.8 GB of render targets that are all in
-use):
-- Levels on demand, **off by default** (`VICTORY_LEVELS_ON_DEMAND=1`): a
-  texture the title fills takes card memory only for the levels the title
-  holds (2.2 to 3.0 GB of the copies were levels it does not hold). Its test
-  runs on the software adapter; it has not run on a card yet.
-- Refused texture slots are held back for a few seconds so that a pass
-  reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
-  room can be kept for the card copies of title buffers
-  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off).
-
-Tools and diagnostics:
-- `victory translate <shader file> --warm all --jobs N` translates every
-  shader ahead of a run, on the processor only (about 4.5 to 6.5 minutes
-  here); the shader cache is keyed on the translator's source, so a new
-  build that does not touch the translator starts warm.
-- Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
-  a copy-back is about to put back to older values: none found in 138,000
-  copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
-  of the copies the texture sweep never lets go.
-
-(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
@@ -101,6 +58,12 @@ VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64
 VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1
 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1
 VICTORY_CARD_REHASH_RUNS=1`.
+
+Newest from the same campaign: `VICTORY_TEXTURE_BACK=1` copies textures
+shaders write back into title memory where the title reads them on the CPU,
+and `VICTORY_CARD_BUFFERS_MIN_KB=64` (with `VICTORY_CARD_BUFFERS_MB=1280`)
+puts the copies of small title buffers in the card's memory (~18 ms of card
+time a frame saved on the test machine).
 
 ## Debugging switches
 

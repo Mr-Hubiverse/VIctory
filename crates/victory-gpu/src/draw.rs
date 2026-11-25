@@ -3955,6 +3955,8 @@ fn readable(
             crate::capture::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_written(std::ptr::from_ref(list) as usize, *resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
