@@ -276,15 +276,17 @@ fn submit_cut(this: This, lists: &[This]) {
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
             .iter()
+            .take(64)
             .map(|&l| match crate::list::host_list(l) {
                 Some(h) => format!("{:#x}", std::ptr::from_ref(h) as usize),
                 None => format!("title {l:?}"),
             })
             .collect();
         format!(
-            "SUBMIT queue kind {:?} held {} lists {named:?} (the first {first} run at once, the rest part by part)",
+            "SUBMIT queue kind {:?} held {} lists, showing {} {named:?} (the first {first} run at once, the rest part by part)",
             Some(queue(this).kind),
-            first < lists.len()
+            first < lists.len(),
+            named.len()
         )
     });
     if first > 0 && crate::host::late() {
@@ -294,11 +296,7 @@ fn submit_cut(this: This, lists: &[This]) {
         let (taken, order) = crate::list::detach(&lists[..first]);
         host.execute_late(taken, order);
     } else if first > 0 {
-        let now: Vec<_> = lists[..first]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&now);
+        host.execute_handles(&lists[..first]);
         // They have run: their descriptor tables' slots are free again, as
         // on the path without cuts ([`execute`]). This path replaced that
         // one without the call, so the lists that run at once kept their
@@ -366,23 +364,21 @@ fn submit_split(this: This, lists: &[This]) {
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
             .iter()
+            .take(64)
             .map(|&l| match crate::list::host_list(l) {
                 Some(h) => format!("{:#x}", std::ptr::from_ref(h) as usize),
                 None => format!("title {l:?}"),
             })
             .collect();
         format!(
-            "SUBMIT queue kind {:?} held {} lists {named:?} (the first {cut} run at once)",
+            "SUBMIT queue kind {:?} held {} lists, showing {} {named:?} (the first {cut} run at once)",
             Some(queue(this).kind),
-            cut < lists.len()
+            cut < lists.len(),
+            named.len()
         )
     });
     if cut > 0 {
-        let now: Vec<_> = lists[..cut]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&now);
+        host.execute_handles(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -864,21 +860,11 @@ fn release_held_now(all: bool) {
                                 host.execute_late(lists, order);
                             }
                         } else {
-                            let ran = {
-                                let runs: Vec<&crate::host::HostList> =
-                                    order.iter().map(|&i| lists[i].host()).collect();
-                                match crate::host::host() {
-                                    Some(host) => {
-                                        host.execute(&runs);
-                                        true
-                                    }
-                                    None => false,
-                                }
-                            };
-                            // They have run: their host lists are used again.
-                            if ran {
-                                crate::list::recycle(lists, &order);
-                            }
+                            let ran = crate::host::host()
+                                .is_some_and(|host| host.execute_detached(&lists, &order));
+                            // Only completed lists enter the reuse pool; an
+                            // allocation failure drops detached lists instead.
+                            crate::list::recycle(lists, if ran { &order } else { &[] });
                         }
                         if all {
                             #[cfg(feature = "diagnostics")]
@@ -1086,21 +1072,18 @@ fn execute_now(this: This, count: u32, lists: *const This) {
             // The lists as the frame's other lines name them (their host sides).
             let named: Vec<String> = lists
                 .iter()
+                .take(64)
                 .map(|&l| match crate::list::host_list(l) {
                     Some(h) => format!("{:#x}", std::ptr::from_ref(h) as usize),
                     None => format!("title {l:?}"),
                 })
                 .collect();
-            format!("SUBMIT queue kind {kind:?} held {kept} lists {named:?}")
+            format!("SUBMIT queue kind {kind:?} held {kept} lists, showing {} {named:?}", named.len())
         });
         if kept {
             return;
         }
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        host.execute_handles(lists);
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
         // another queue waits for.

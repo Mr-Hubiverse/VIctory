@@ -705,7 +705,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::Pending::shared(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -919,8 +919,8 @@ mod make;
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]
-pub(crate) fn trim_library() {
-    library::trim();
+pub(crate) fn trim_library(force: bool) {
+    library::trim(force);
 }
 
 /// The pipeline library's part of the report when the host device is

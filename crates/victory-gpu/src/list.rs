@@ -270,11 +270,26 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    // A queue may name the same detached list repeatedly. Avoid scanning
+    // the entire order for every detached list when a large submission is
+    // recycled after bounded execution.
+    let mut ran_set = Vec::new();
+    if let Err(error) = ran_set.try_reserve_exact(lists.len()) {
+        tracing::warn!(error = %error, lists = lists.len(), "detached lists were not added to the reuse pool");
+        drop(lists);
+        return;
+    }
+    ran_set.resize(lists.len(), false);
+    for &i in ran {
+        if let Some(done) = ran_set.get_mut(i) {
+            *done = true;
+        }
+    }
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran_set[i] || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -458,15 +473,30 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
+    let mut indices = std::collections::HashMap::new();
+    let mut taken: Vec<Detached> = Vec::new();
     let mut order = Vec::new();
     for &this in lists {
         if this.is_null() {
             continue;
         }
-        if let Some(i) = taken.iter().position(|(t, _)| *t == this) {
+        if let Some(&i) = indices.get(&this) {
+            if let Err(error) = order.try_reserve(1) {
+                crate::host::request_memory_sweep();
+                tracing::error!(error = %error, lists = lists.len(), "could not reserve detached-list order");
+                break;
+            }
             order.push(i);
             continue;
+        }
+        if let Err(error) = indices
+            .try_reserve(1)
+            .and_then(|()| taken.try_reserve(1))
+            .and_then(|()| order.try_reserve(1))
+        {
+            crate::host::request_memory_sweep();
+            tracing::error!(error = %error, lists = lists.len(), "could not reserve detached-list metadata");
+            break;
         }
         let Some(fresh) = fresh_list() else {
             continue;
@@ -486,17 +516,16 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let state = std::mem::take(&mut *(*list).state.get());
             (host, uploads, state)
         };
-        order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        let i = taken.len();
+        order.push(i);
+        taken.push(Detached {
+            host,
+            _uploads: uploads,
+            _state: state,
+        });
+        indices.insert(this, i);
     }
-    (taken.into_iter().map(|(_, d)| d).collect(), order)
+    (taken, order)
 }
 
 pub(crate) extern "system" fn create_allocator(

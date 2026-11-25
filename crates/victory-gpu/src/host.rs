@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -40,6 +40,16 @@ const RTV_RING: u32 = 1024;
 
 /// Whether the host device has GPU upload heaps (asked when it is made).
 static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep the per-submission command-list and diagnostic arrays bounded even
+/// when a queue receives tens of thousands of title lists at once.
+const MAX_SUBMISSION_RUNS: usize = 4096;
+
+fn submission_ranges(len: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..len).step_by(MAX_SUBMISSION_RUNS).map(move |start| {
+        start..(start + MAX_SUBMISSION_RUNS).min(len)
+    })
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -112,8 +122,9 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM and commit headroom in bytes, from
-/// `GlobalMemoryStatusEx`.
+/// Available physical RAM and process commit headroom in bytes, from
+/// `GlobalMemoryStatusEx`. `ullAvailPageFile` is process-specific and is no
+/// greater than system-wide available commit; Event 2004 reports the latter.
 pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
@@ -167,9 +178,9 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     }
 }
 
-/// Idle timeout for system-RAM caches when commit headroom is low.
-/// `ullAvailPageFile` is the remaining system commit capacity; physical RAM
-/// can still be available after the commit limit has nearly been reached.
+/// Idle timeout for system-RAM caches when process commit headroom is low.
+/// Physical RAM can still be available after the commit limit has nearly
+/// been reached.
 pub(crate) fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
@@ -224,7 +235,32 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
+/// A failed committed-resource allocation asks the next safe point to sweep.
+static SWEEP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Lets the next safe submission point sweep idle GPU caches after D3D12
+/// reports an allocation failure. Do not sweep in the allocation call: some
+/// callers still hold the resource-table locks that the sweep takes.
+pub(crate) fn request_memory_sweep() {
+    SWEEP_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Keep the sweep cadence no slower than the cache expiry under commit
+/// pressure, capped at the existing one-second normal cadence.
+fn sweep_interval_ms(available_commit: Option<u64>) -> u64 {
+    commit_idle_ms(available_commit).min(1_000)
+}
+
+fn force_sweep(available_commit: Option<u64>, requested: bool) -> bool {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    requested || available_commit.is_some_and(|available| available < GIB)
+}
+
+fn sweep_due(now: u64, last: u64, interval_ms: u64, force: bool) -> bool {
+    force || now.saturating_sub(last) >= interval_ms
+}
+
+/// Once a second normally, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
@@ -236,18 +272,26 @@ fn sweep() {
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let available = available_system_memory();
+    let interval_ms = sweep_interval_ms(available.map(|(_, commit)| commit));
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
-        || LAST
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-    {
+    let requested = SWEEP_REQUESTED.swap(false, Ordering::AcqRel);
+    let force = force_sweep(available.map(|(_, commit)| commit), requested);
+    if !sweep_due(now, last, interval_ms, force) {
         return;
     }
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if requested {
+            SWEEP_REQUESTED.store(true, Ordering::Release);
+        }
+        return;
+    }
+    crate::pipeline::trim_library(force);
+    crate::shadow::let_go_idle(force);
+    crate::texture::let_go_idle(force);
+    // `host_resource` returns a borrowed COM pointer rather than an Arc; its
+    // idle window protects the interval before a list or slot pins it.
     crate::resource::let_go_idle();
 }
 
@@ -820,24 +864,36 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 }
 
 impl Host {
-    /// Whether this device is on the software adapter (WARP or the basic render driver): asked of the adapter the
-    /// device reports, not of a switch. Used by the tests that need a card.
-    #[cfg(test)]
-    pub(crate) fn is_software(&self) -> bool {
-        self.adapter
-            .as_ref()
-            .and_then(|adapter| adapter.cast::<IDXGIAdapter1>().ok())
-            // SAFETY: a plain adapter query.
-            .and_then(|adapter| unsafe { adapter.GetDesc1().ok() })
-            .is_some_and(|desc| {
-                desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
-            })
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn submission_ranges_bound_each_batch_without_reordering() {
+        for len in [0, 1, super::MAX_SUBMISSION_RUNS, super::MAX_SUBMISSION_RUNS + 1, super::MAX_SUBMISSION_RUNS * 3 + 7] {
+            let mut next = 0;
+            for range in super::submission_ranges(len) {
+                assert_eq!(range.start, next);
+                assert!(range.len() <= super::MAX_SUBMISSION_RUNS);
+                next = range.end;
+            }
+            assert_eq!(next, len);
+        }
+    }
+
+    #[test]
+    fn raw_memory_reads_follow_each_list_and_guest_copies() {
+        let mut first = super::Deferred::default();
+        let mut second = super::Deferred::default();
+        assert_eq!(first.raw_copies.advance(2, false), (0..2, 2..2));
+        assert_eq!(second.raw_copies.advance(5, true), (0..5, 0..5));
+        assert_eq!(first.raw_copies.advance(5, true), (2..5, 0..5));
+        assert_eq!(first.raw_copies.advance(5, true), (5..5, 5..5));
+        first.invalidate_refreshes();
+        assert_eq!(first.raw_copies.advance(5, false), (0..5, 5..5));
+        assert_eq!(first.raw_copies.advance(6, true), (5..6, 5..6));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -999,8 +1055,6 @@ mod tests {
             assert_eq!(std::sync::Arc::as_ptr(a), std::sync::Arc::as_ptr(b));
             assert_eq!((aa, al), (ba, bl));
         }
-        drop(one);
-        drop(batched);
         crate::shadow::unregister(ID, address);
     }
 
@@ -1136,7 +1190,6 @@ unsafe impl Sync for HostList {}
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
-/// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
 #[derive(Default)]
 struct Gather {
     /// Something recorded in the list may write arguments: no record is
@@ -2614,7 +2667,6 @@ pub(crate) fn copy_fetch_runs<'a>(
     pieces: impl Iterator<Item = (&'a ID3D12Resource, usize, usize, u64)>,
 ) {
     let mut pieces = pieces.peekable();
-    let mut copies = 0;
     while let Some((source, lo, mut hi, at)) = pieces.next() {
         while let Some(&(next, from, to, out)) = pieces.peek()
             && next == source && from == hi && out == at + (hi - lo) as u64
@@ -2625,7 +2677,6 @@ pub(crate) fn copy_fetch_runs<'a>(
         // SAFETY: the original adjacent ranges lie inside the same live
         // source and destination, retained by the caller through its fence.
         unsafe { list.CopyBufferRegion(destination, at, source, lo as u64, (hi - lo) as u64) };
-        copies += 1;
     }
 }
 
@@ -3022,6 +3073,35 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Host(_) => {}
+            }
+        }
+    }
+    None
+}
+
+/// The first list whose CPU preparation would read a texture that an
+/// earlier list in this same batch still needs to publish.
+fn texture_dependency_cut(runs: &[&HostList]) -> Option<usize> {
+    if runs.len() < 2 {
+        return None;
+    }
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    for (index, list) in runs.iter().enumerate() {
+        if !pending.is_empty()
+            && blocked_by(&pending, std::slice::from_ref(list), false).is_some()
+        {
+            return Some(index);
+        }
+        if index + 1 < runs.len() {
+            let mut destinations: Vec<_> = list
+                .deferred()
+                .texture_backs
+                .iter()
+                .map(crate::texback::Back::range)
+                .collect();
+            if !destinations.is_empty() {
+                crate::texback::add_destination_aliases(&mut destinations);
+                join_ranges(&mut pending, destinations);
             }
         }
     }
@@ -5774,15 +5854,97 @@ impl Host {
         let _ = self.submit(runs, false);
     }
 
+    /// Runs title handles in bounded chunks without first materializing a
+    /// second vector proportional to the whole queue submission.
+    pub(crate) fn execute_handles(&self, handles: &[crate::object::This]) -> bool {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if handles.is_empty() {
+            if let Err((_, error)) = self.submit_locked(&[], false, submitted) {
+                tracing::error!(error = %error, "could not reserve memory for an empty GPU submission");
+                return false;
+            }
+            return true;
+        }
+        for range in submission_ranges(handles.len()) {
+            let chunk = &handles[range];
+            let mut runs = Vec::new();
+            if let Err(error) = runs.try_reserve_exact(chunk.len()) {
+                request_memory_sweep();
+                tracing::error!(error = %error, lists = chunk.len(), "could not reserve bounded queue-list references");
+                return false;
+            }
+            runs.extend(chunk.iter().filter_map(|&handle| crate::list::host_list(handle)));
+            match self.submit_locked(&runs, false, submitted) {
+                Ok((next, sent, _)) => {
+                    debug_assert!(sent.is_none());
+                    submitted = next;
+                }
+                Err((next, error)) => {
+                    tracing::error!(error = %error, "could not reserve memory for a bounded GPU submission");
+                    drop(next);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Runs detached lists in order, with only one bounded reference vector
+    /// alive at a time.
+    pub(crate) fn execute_detached(
+        &self,
+        lists: &[crate::list::Detached],
+        order: &[usize],
+    ) -> bool {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if order.is_empty() {
+            if let Err((_, error)) = self.submit_locked(&[], false, submitted) {
+                tracing::error!(error = %error, "could not reserve memory for an empty GPU submission");
+                return false;
+            }
+            return true;
+        }
+        for range in submission_ranges(order.len()) {
+            let chunk = &order[range];
+            let mut runs = Vec::new();
+            if let Err(error) = runs.try_reserve_exact(chunk.len()) {
+                request_memory_sweep();
+                tracing::error!(error = %error, lists = chunk.len(), "could not reserve bounded detached-list references");
+                return false;
+            }
+            runs.extend(chunk.iter().map(|&i| lists[i].host()));
+            match self.submit_locked(&runs, false, submitted) {
+                Ok((next, sent, _)) => {
+                    debug_assert!(sent.is_none());
+                    submitted = next;
+                }
+                Err((next, error)) => {
+                    tracing::error!(error = %error, "could not reserve memory for a bounded GPU submission");
+                    drop(next);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// A queue's submission with [`late`]: the host lists `lists`, taken
     /// from the title's, go to the card in `order` and are not waited for.
     /// They join the line of flights and are settled, with the others in
     /// the air, at the next point where what they do can be observed
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
-    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, mut order: Vec<usize>) {
         if order.is_empty() {
-            crate::list::recycle(lists, &order);
+            crate::list::recycle(lists, &[]);
+            return;
+        }
+        if order.len() > MAX_SUBMISSION_RUNS {
+            // A single very large flight would need full-size dependency,
+            // write-back and diagnostic vectors. Preserve queue order and
+            // reclaim the detached lists, but wait between bounded chunks.
+            let ran = self.execute_detached(&lists, &order);
+            crate::list::recycle(lists, if ran { &order } else { &[] });
             return;
         }
         late_threads();
@@ -5790,11 +5952,15 @@ impl Host {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)
         };
-        let Some((mut submitted, sent)) = sent else {
-            // (Not reached: a submission sent ahead always comes back.)
-            crate::list::recycle(lists, &order);
+        let Some((mut submitted, sent, already_run)) = sent else {
+            // Allocation can still fail for a single-run submission after
+            // every smaller workspace has been tried. Do not treat it as a
+            // successful flight.
+            crate::list::recycle(lists, &[]);
             return;
         };
+        // Only the final segment still has read-backs to land in the flight.
+        order.drain(..already_run);
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
@@ -5843,7 +6009,7 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], true) else {
+        let Some((submitted, sent, _)) = self.submit(&[list], true) else {
             return 0;
         };
         let number = sent.number;
@@ -6034,16 +6200,169 @@ impl Host {
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent, usize)> {
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        match self.submit_locked(runs, late, submitted) {
+            Ok((submitted, Some(sent), already_run)) => Some((submitted, sent, already_run)),
+            Ok((_, None, _)) => None,
+            Err((_, error)) => {
+                tracing::error!(error = %error, lists = runs.len(), "could not reserve memory for a bounded GPU submission");
+                None
+            }
+        }
+    }
+
+    /// Submits while keeping the caller's submission lock across adjacent
+    /// bounded chunks, so another queue cannot be inserted between them.
+    fn submit_locked<'a>(
+        &'a self,
+        mut runs: &[&HostList],
+        late: bool,
+        mut submitted: std::sync::MutexGuard<'a, u64>,
+    ) -> Result<
+        (std::sync::MutexGuard<'a, u64>, Option<Sent>, usize),
+        (std::sync::MutexGuard<'a, u64>, std::collections::TryReserveError),
+    > {
         #[cfg(feature = "diagnostics")]
-        let called = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_begins();
-        #[cfg(feature = "diagnostics")]
-        crate::profile::seen(crate::profile::Seen::Submit);
+        let mut called = Instant::now();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut already_run = 0;
+        while let Some(cut) = texture_dependency_cut(runs) {
+            let (next, sent, ran) = self.submit_segment(
+                &runs[..cut],
+                false,
+                submitted,
+                #[cfg(feature = "diagnostics")]
+                called,
+            )?;
+            debug_assert!(sent.is_none());
+            submitted = next;
+            already_run += ran;
+            runs = &runs[cut..];
+            #[cfg(feature = "diagnostics")]
+            { called = Instant::now(); }
+        }
+        let (submitted, sent, ran) = self.submit_segment(
+            runs,
+            late,
+            submitted,
+            #[cfg(feature = "diagnostics")]
+            called,
+        )?;
+        already_run += ran;
+        Ok((submitted, sent, already_run))
+    }
+
+    /// Submits a dependency-safe segment in bounded chunks. Only its final
+    /// chunk may be sent ahead; earlier chunks are waited for in queue order.
+    fn submit_segment<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+        mut submitted: std::sync::MutexGuard<'a, u64>,
+        #[cfg(feature = "diagnostics")] mut called: Instant,
+    ) -> Result<
+        (std::sync::MutexGuard<'a, u64>, Option<Sent>, usize),
+        (std::sync::MutexGuard<'a, u64>, std::collections::TryReserveError),
+    > {
+        if runs.is_empty() {
+            return self.submit_adaptive(
+                runs,
+                late,
+                submitted,
+                #[cfg(feature = "diagnostics")]
+                called,
+            );
+        }
+        let mut already_run = 0;
+        let mut ranges = submission_ranges(runs.len()).peekable();
+        while let Some(range) = ranges.next() {
+            let send_ahead = late && ranges.peek().is_none();
+            let result = self.submit_adaptive(
+                &runs[range],
+                send_ahead,
+                submitted,
+                #[cfg(feature = "diagnostics")]
+                called,
+            );
+            let (next, sent, ran) = result?;
+            submitted = next;
+            already_run += ran;
+            if send_ahead {
+                return Ok((submitted, sent, already_run));
+            }
+            #[cfg(feature = "diagnostics")]
+            { called = Instant::now(); }
+        }
+        Ok((submitted, None, already_run))
+    }
+
+    /// Retries a failed bounded allocation as two smaller synchronous
+    /// submissions. The right half keeps the caller's `late` choice, so the
+    /// original order and the one-flight-at-the-end rule are preserved.
+    fn submit_adaptive<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+        submitted: std::sync::MutexGuard<'a, u64>,
+        #[cfg(feature = "diagnostics")] called: Instant,
+    ) -> Result<
+        (std::sync::MutexGuard<'a, u64>, Option<Sent>, usize),
+        (std::sync::MutexGuard<'a, u64>, std::collections::TryReserveError),
+    > {
+        match self.submit_part(
+            runs,
+            late,
+            submitted,
+            #[cfg(feature = "diagnostics")]
+            called,
+        ) {
+            Ok((submitted, sent)) => {
+                let already_run = if sent.is_some() { 0 } else { runs.len() };
+                Ok((submitted, sent, already_run))
+            }
+            Err((submitted, _error)) if runs.len() > 1 => {
+                let middle = runs.len() / 2;
+                let (submitted, sent, left_run) = self.submit_adaptive(
+                    &runs[..middle],
+                    false,
+                    submitted,
+                    #[cfg(feature = "diagnostics")]
+                    Instant::now(),
+                )?;
+                debug_assert!(sent.is_none());
+                let (submitted, sent, right_run) = self.submit_adaptive(
+                    &runs[middle..],
+                    late,
+                    submitted,
+                    #[cfg(feature = "diagnostics")]
+                    Instant::now(),
+                )?;
+                Ok((submitted, sent, left_run + right_run))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Keeps the submission lock across dependent segments so another
+    /// submitter cannot insert commands inside the title's single submission.
+    fn submit_part<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+        mut submitted: std::sync::MutexGuard<'a, u64>,
+        #[cfg(feature = "diagnostics")] called: std::time::Instant,
+    ) -> Result<
+        (std::sync::MutexGuard<'a, u64>, Option<Sent>),
+        (std::sync::MutexGuard<'a, u64>, std::collections::TryReserveError),
+    > {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::submission_begins();
         let was_working = working(true);
         submitting(1, runs.len());
         // Under the submission lock, before inspecting dependencies. A remap
@@ -6083,6 +6402,32 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Reserve the command-list workspace before this submission gets a
+        // number or changes descriptor/shadow state. A failed reservation
+        // asks the adaptive caller to retry with fewer runs.
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::new();
+        if let Err(error) = lists.try_reserve_exact(2 * runs.len() + 1) {
+            request_memory_sweep();
+            submitting(0, 0);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::submission_ends(Instant::now().saturating_duration_since(called).as_micros() as u64);
+            working(was_working);
+            return Err((submitted, error));
+        }
+        #[cfg(feature = "diagnostics")]
+        let mut firsts = if timing() {
+            let mut firsts = Vec::new();
+            if let Err(error) = firsts.try_reserve_exact(runs.len()) {
+                request_memory_sweep();
+                submitting(0, 0);
+                crate::copystat::submission_ends(Instant::now().saturating_duration_since(called).as_micros() as u64);
+                working(was_working);
+                return Err((submitted, error));
+            }
+            Some(firsts)
+        } else {
+            None
+        };
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6094,9 +6439,6 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
@@ -6134,7 +6476,10 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            if let Some(firsts) = &mut firsts {
+                firsts.push(lists.len());
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -6195,11 +6540,12 @@ impl Host {
                 writes,
             };
             working(was_working);
-            return Some((submitted, sent));
+            return Ok((submitted, Some(sent)));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+            let firsts = firsts.as_ref().expect("timing reserves per-run offsets");
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -6258,7 +6604,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -6347,7 +6692,7 @@ impl Host {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
         working(was_working);
-        None
+        Ok((submitted, None))
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -7073,7 +7418,7 @@ impl HostList {
         if !crate::texback::wanted(resource) {
             return;
         }
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
             && let Some(target) = crate::texback::Target::new(resource)
         {
@@ -7404,7 +7749,7 @@ impl HostList {
     /// pipeline's address names no other).
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
         {
-            let mut deferred = self.deferred();
+            let deferred = self.deferred();
             if !deferred.bound.insert(pso.as_raw() as usize) {
                 return;
             }
@@ -7423,7 +7768,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -7484,7 +7829,7 @@ impl HostList {
         &self,
         refreshes: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
     ) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         for (shadow, address, len) in refreshes {
             let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
             if deferred.refreshed.insert(key) {
@@ -7509,7 +7854,7 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred
@@ -7612,7 +7957,7 @@ impl HostList {
             })
             .as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
@@ -7634,7 +7979,6 @@ impl HostList {
                     words.add(k).write_volatile(0);
                 }
             })));
-            drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
             }
@@ -7751,7 +8095,7 @@ impl HostList {
     /// begins however it is submitted.
     fn indirect_common(&self, scratch: &ID3D12Resource) {
         {
-            let mut deferred = self.deferred();
+            let deferred = self.deferred();
             if deferred.indirect_readable != scratch.as_raw() as usize {
                 return;
             }
@@ -7813,7 +8157,7 @@ impl HostList {
         count: usize,
         writes: bool,
     ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         let id = directory.as_raw() as usize;
         if deferred.raw_copies.directory != id {
             deferred.kept.push(directory.clone().into());
@@ -7827,10 +8171,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.invalidate_refreshes();
-        drop(deferred);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8620,6 +8963,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                if e.code().0 == crate::object::E_OUTOFMEMORY {
+                    request_memory_sweep();
+                }
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -9548,6 +9894,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                if e.code().0 == crate::object::E_OUTOFMEMORY {
+                    request_memory_sweep();
+                }
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
@@ -9592,6 +9941,9 @@ impl Host {
         match made {
             Ok(()) => buffer,
             Err(e) => {
+                if e.code().0 == crate::object::E_OUTOFMEMORY {
+                    request_memory_sweep();
+                }
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
             }
@@ -10319,13 +10671,13 @@ void main() {
         const LEFT: u32 = 0x600D_0002;
         // Flight A, and the card has run it.
         let a = record(20, HALF_WAY, LEFT, 16);
-        let (submitted, mut sent_a) = host.submit(&[&a], true).expect("flight A sent ahead");
+        let (submitted, mut sent_a, _) = host.submit(&[&a], true).expect("flight A sent ahead");
         let fence_a = *submitted;
         drop(submitted);
         wait_for(fence_a);
         // Flight B: the same piece, through the half-way value, for seconds.
         let b = record(20, HALF_WAY, LEFT, spin);
-        let (submitted, mut sent_b) = host.submit(&[&b], true).expect("flight B sent ahead");
+        let (submitted, mut sent_b, _) = host.submit(&[&b], true).expect("flight B sent ahead");
         let fence_b = *submitted;
         drop(submitted);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -10389,6 +10741,37 @@ void main() {
         assert_eq!(commit_idle_ms(Some(267 * mib)), 250);
         assert_eq!(commit_idle_ms(Some(0)), 250);
         assert_eq!(commit_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn sweep_interval_shortens_under_commit_pressure() {
+        use super::sweep_interval_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(sweep_interval_ms(Some(4 * gib)), 1_000);
+        assert_eq!(sweep_interval_ms(Some(903 * mib)), 500);
+        assert_eq!(sweep_interval_ms(Some(267 * mib)), 250);
+        assert_eq!(sweep_interval_ms(None), 1_000);
+    }
+
+    #[test]
+    fn requested_sweep_bypasses_the_interval() {
+        use super::sweep_due;
+        assert!(!sweep_due(999, 0, 1_000, false));
+        assert!(sweep_due(1_000, 0, 1_000, false));
+        assert!(sweep_due(1, 1_000, 1_000, true));
+    }
+
+    #[test]
+    fn critical_commit_headroom_forces_cache_sweep() {
+        use super::force_sweep;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert!(force_sweep(Some(903 * mib), false));
+        assert!(force_sweep(Some(0), false));
+        assert!(!force_sweep(Some(2 * gib), false));
+        assert!(!force_sweep(None, false));
+        assert!(force_sweep(None, true));
     }
 
     #[test]

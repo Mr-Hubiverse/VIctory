@@ -553,7 +553,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(force: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -570,7 +570,7 @@ pub(crate) fn let_go_idle() {
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || (!force && !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES));
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);

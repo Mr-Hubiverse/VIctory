@@ -489,6 +489,9 @@ fn twin_texture(
         )
     };
     if let Err(e) = made {
+        if e.code().0 == E_OUTOFMEMORY {
+            crate::host::request_memory_sweep();
+        }
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
     let Some(texture) = texture else {
@@ -552,6 +555,9 @@ fn twin_texture(
             )
         };
         if let Err(e) = made {
+            if e.code().0 == E_OUTOFMEMORY {
+                crate::host::request_memory_sweep();
+            }
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
@@ -2195,6 +2201,9 @@ fn host_texture_as(
         }
     };
     if let Err(e) = made {
+        if e.code().0 == E_OUTOFMEMORY {
+            crate::host::request_memory_sweep();
+        }
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if let Some(t) = &texture {

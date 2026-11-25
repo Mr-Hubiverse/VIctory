@@ -2750,7 +2750,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(force: bool) {
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
@@ -2764,7 +2764,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && (force || crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES))
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)

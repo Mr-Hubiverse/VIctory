@@ -366,7 +366,7 @@ pub(crate) fn removal_note() -> String {
 /// Called once a second by the sweep; does its work on a thread of its own
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
-pub(crate) fn trim() {
+pub(crate) fn trim(force: bool) {
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
@@ -376,7 +376,7 @@ pub(crate) fn trim() {
         return;
     }
     let quiet_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
-    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
+    if (!force && crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms)
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;

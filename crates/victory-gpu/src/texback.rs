@@ -141,6 +141,26 @@ impl Back {
     }
 }
 
+/// Expand a submission's intervals through currently mapped title aliases,
+/// after releasing each list lock. CPU preparation may use any such view.
+pub(crate) fn add_destination_aliases(ranges: &mut Vec<(usize, usize)>) {
+    const PAGE: usize = 64 << 10;
+    for index in 0..ranges.len() {
+        let (at, end) = ranges[index];
+        let mut page = at & !(PAGE - 1);
+        while page < end {
+            let lo = at.saturating_sub(page);
+            let hi = (end - page).min(PAGE);
+            for alias in crate::inplace::pages_of(page) {
+                if alias != page {
+                    ranges.push((alias + lo, alias + hi));
+                }
+            }
+            page = page.saturating_add(PAGE);
+        }
+    }
+}
+
 /// Records a host copy from a texture already in COPY_SOURCE.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     if !target.ticket.valid.load(Ordering::Acquire) {
