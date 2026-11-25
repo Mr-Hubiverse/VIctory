@@ -76,6 +76,37 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
 
+/// The root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// marks the 64 KiB title pages it writes through unordered buffer views
+/// from the heap ("Write marks"): a raw buffer the host keeps of two
+/// dwords per view-heap slot, the mark entry of the unordered buffer view
+/// there — a base bit and a phase (0-65535). A write of byte `x` of the
+/// view (its offset in the view, an element times the stride plus the
+/// offset) sets bit `base + ((phase + x) >> 16)` in [`SLOT_VIEW_WRITES`]
+/// for the access's first and last byte, at most [`VIEW_WRITE_BITS`] - 1.
+/// Base [`VIEW_MARK_NONE`]: nothing is marked. The host gives each copy of
+/// title memory a run of bits, one per 64 KiB title page it touches, and a
+/// view the bit of its first byte's page as base with that byte's offset
+/// in its page as phase.
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// The root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`]: the bitmap of
+/// [`VIEW_WRITE_BITS`] bits those shaders set ([`SLOT_VIEW_MARKS`]), so the
+/// host copies back only what shaders wrote.
+pub const SLOT_VIEW_WRITES: u8 = 251;
+/// A view-mark table entry's base for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the [`SLOT_VIEW_WRITES`] bitmap; marks past it go to the last
+/// bit.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+
+/// Whether unordered buffer view writes mark their pages (`VICTORY_VIEW_MARKS`,
+/// off unless asked for): a shader translated without it does not declare the
+/// two root views, and code reading an unbound one hung the card.
+pub(crate) fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v != "0"))
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -160,6 +191,10 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The heap index of each handle of an unordered buffer view (writes
+    /// through it are marked by the index's view-mark entry,
+    /// [`SLOT_VIEW_MARKS`]).
+    pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -217,6 +252,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -446,7 +482,19 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12): writes
+        // through them mark their pages ([`SLOT_VIEW_MARKS`]). Opt-in
+        // (`VICTORY_VIEW_MARKS`): the pipeline binds the two root views
+        // only then, and code reading an unbound one hangs the card.
+        if !sampler
+            && props.0 & 0x1000 != 0
+            && (10..=12).contains(&(props.0 & 0xFF))
+            && view_marks()
+        {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.

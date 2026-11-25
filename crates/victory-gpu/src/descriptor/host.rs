@@ -54,6 +54,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the mark entry (bit, offset in its page) of the buffer
+    /// view at each title slot, for shaders that mark the pages they write
+    /// through views picked by index (`victory_shader::emit`
+    /// `SLOT_VIEW_MARKS`): an upload buffer of `SLOT_STRIDES_COUNT`
+    /// dword pairs, its GPU address and its mapping.
+    marks: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -788,6 +794,20 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let marks = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer. Every
+                // slot starts as marking nothing.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0xFF, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view write marks by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -801,6 +821,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            marks,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -941,6 +962,12 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The mark table (`victory_shader::emit` `SLOT_VIEW_MARKS`) of this
+    /// heap's title slots: its buffer.
+    pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
+        self.marks.as_ref().map(|m| &m.0)
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -1456,6 +1483,26 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.marks
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The slot's mark entry: the page bit and page offset of the
+            // view's first byte, where the copy it is of marks its pages
+            // (`Shadow::mark_entry`); none where it does not (not a copy,
+            // or in the card's memory). Base `VIEW_MARK_NONE`: the shader
+            // marks nothing and the range is declared.
+            let (base, phase) = view
+                .and_then(buffer_copy)
+                .and_then(|(shadow, address, _)| shadow.mark_entry(address))
+                .unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword pair, either value is one the slot had).
+            unsafe {
+                let at = (*data as *mut u32).add(index as usize * 2);
+                at.write_volatile(base);
+                at.add(1).write_volatile(phase);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {

@@ -1651,8 +1651,12 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy,
+    /// the last value where they mark the pages they write in the views'
+    /// bitmap instead (`victory_shader::emit` `SLOT_VIEW_MARKS`): no
+    /// snapshot for it, the marked pages alone are compared
+    /// (`crate::shadow::copy_back_marks`).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1987,7 +1991,12 @@ fn late_writes() -> bool {
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+/// The ranges of a copy a submission's shaders may write (title memory
+/// addresses, each once), and whether any was declared marked
+/// (`victory_shader::emit` `SLOT_VIEW_MARKS`): a marked range holds the
+/// copy's whole span and no snapshot — its pages are compared from the
+/// views' bitmap (`crate::shadow::copy_back_marks`).
+type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>, bool);
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -2503,14 +2512,50 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
-fn relay_hand_back(back: &[Declared]) {
+/// `crate::shadow::copy_back_marks` for a landing's declared writes
+/// (`back`): the bits of the copies it declared marked are settled.
+/// `landed` counts, per copy (`Arc::as_ptr`), how many of the batch's
+/// submissions declared it marked: where more submissions still in the
+/// air hold its marked range (`Shadow::flights_holding`), the bits stay
+/// set for that landing — a copy's marked pages are settled once, when
+/// the last submission that may write them has landed.
+fn copy_back_marks(back: &[Declared], landed: &std::collections::HashMap<usize, u32>) {
+    let mut settle = std::collections::HashSet::new();
+    let mut withheld = std::collections::HashSet::new();
+    for (shadow, _, has_marked) in back {
+        if !*has_marked {
+            continue;
+        }
+        let owner = std::sync::Arc::as_ptr(shadow) as usize;
+        settle.insert(owner);
+        let held = shadow.marked_ranges().iter().map(|&r| shadow.flights_holding(r)).max().unwrap_or(0);
+        if held > landed.get(&owner).copied().unwrap_or(0) {
+            withheld.insert(owner);
+        }
+    }
+    let (pages, written, _kept) = crate::shadow::copy_back_marks(&settle, &withheld);
+    if pages != 0 {
+        COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::MarkedPages, pages);
+            add(C::MarkedBytes, written);
+            add(C::MarkedKept, _kept);
+        }
+    }
+}
+
+fn relay_hand_back(back: &[Declared], landed: &std::collections::HashMap<usize, u32>) {
+    copy_back_marks(back, landed);
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for (shadow, declared) in back {
+    for (shadow, declared, _) in back {
         if shadow.carded() {
             continue;
         }
+        let marked = shadow.marked_ranges();
         let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
+        join_ranges(&mut spans, declared.iter().copied().filter(|r| !marked.contains(r)));
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
@@ -2714,15 +2759,23 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
+            if let Step::GpuWrite(shadow, address, len, marked) = step {
+                // A marked declaration holds the whole copy
+                // (`Shadow::writing`), so that is what is done with at
+                // the copy-back.
+                let range = if *marked {
+                    shadow.title_span()
+                } else {
+                    (*address, *address + *len)
+                };
+                match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, ranges, has)) => {
                         if !ranges.contains(&range) {
                             ranges.push(range);
                         }
+                        *has |= *marked;
                     }
-                    None => back.push((shadow.clone(), vec![range])),
+                    None => back.push((shadow.clone(), vec![range], *marked)),
                 }
             }
         }
@@ -2943,16 +2996,22 @@ mod landings_tests {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+fn hand_back(back: &[Declared], landed: &std::collections::HashMap<usize, u32>) {
+    // The pages shaders marked through their views
+    // (`victory_shader::emit` `SLOT_VIEW_MARKS`): compared by page, the
+    // rest of their declared ranges not at all — `before` holds nothing
+    // for them (`Shadow::writing`).
+    copy_back_marks(back, landed);
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
+        for (shadow, declared, _) in back {
             if shadow.carded() {
                 continue;
             }
-            let mut sorted = declared.clone();
+            let marked = shadow.marked_ranges();
+            let mut sorted: Vec<(usize, usize)> = declared.iter().copied().filter(|r| !marked.contains(r)).collect();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
             for (from, to) in sorted {
@@ -2975,12 +3034,12 @@ fn hand_back(back: &[Declared]) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
-        for (shadow, declared) in back {
+        for (shadow, declared, _) in back {
             shadow.copy_back_done(declared);
         }
         return;
     }
-    for (shadow, declared) in back {
+    for (shadow, declared, _) in back {
         if shadow.carded() {
             // Done before (`Host::card_back`).
             shadow.copy_back_done(declared);
@@ -2991,8 +3050,10 @@ fn hand_back(back: &[Declared]) {
         // every one whole was gigabytes a frame (0.3-0.5 s) for the few
         // MB shaders wrote. Only ranges that overlap or touch are
         // joined: what lies between two was not given to shaders (the
-        // snapshot does not hold it).
-        let mut sorted = declared.clone();
+        // snapshot does not hold it). Ranges declared marked are out:
+        // their pages were compared from the bitmap.
+        let marked = shadow.marked_ranges();
+        let mut sorted: Vec<(usize, usize)> = declared.iter().copied().filter(|r| !marked.contains(r)).collect();
         sorted.sort_unstable();
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for (from, to) in sorted {
@@ -3283,7 +3344,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, ..) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -3692,25 +3753,30 @@ impl Host {
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
+                let mut landed: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    for (shadow, ranges, marked) in &flight.back {
+                        if *marked {
+                            *landed.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default() += 1;
+                        }
+                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all, has)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
+                                *has |= *marked;
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((shadow.clone(), ranges.clone(), *marked)),
                         }
                     }
                 }
-                relay_hand_back(&back);
+                relay_hand_back(&back, &landed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
+                    for (shadow, ranges, _) in &flight.back {
                         shadow.copy_back_done(ranges);
                     }
                 }
@@ -3765,7 +3831,7 @@ impl Host {
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.back.iter().flat_map(|(_, r, _)| r.iter().copied()));
                 }
             }
             join_ranges(written, ranges);
@@ -3944,7 +4010,7 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3988,7 +4054,7 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4100,6 +4166,7 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut landed: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -4107,20 +4174,24 @@ impl Host {
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
                     }
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    for (shadow, ranges, marked) in &flight.back {
+                        if *marked {
+                            *landed.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default() += 1;
+                        }
+                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all, has)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
+                                *has |= *marked;
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((shadow.clone(), ranges.clone(), *marked)),
                         }
                     }
                 }
-                hand_back(&back);
+                hand_back(&back, &landed);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -4423,7 +4494,8 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        // One submission, waited for: nothing in the air withholds marks.
+        hand_back(&back, &std::collections::HashMap::new());
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5215,15 +5287,18 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// `marked`: they mark the pages they write in the views' bitmap, and
+    /// no snapshot is taken (`crate::shadow::copy_back_marks`).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5446,7 +5521,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, marked) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -5455,7 +5530,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    shadow.writing(*address, *len, *marked);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);

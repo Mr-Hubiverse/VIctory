@@ -127,6 +127,12 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Pages shaders marked through their views (`SLOT_VIEW_MARKS`), the
+    /// bytes of them put back to title memory, and the pages kept as the
+    /// title's because it wrote them too (`copy_back_marks`).
+    MarkedPages,
+    MarkedBytes,
+    MarkedKept,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1101,7 +1107,8 @@ pub(crate) fn log(frames: f64) {
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
-         {:.0} steps {:.1} MB left out",
+         {:.0} steps {:.1} MB left out; marked pages: {:.0} ({:.1} MB \
+         put back, {:.0} kept the title's)",
         c[C::RecordCalls as usize],
         c[C::RecordNs as usize] / 1e6,
         ms(c[C::PipelineWaitUs as usize]),
@@ -1120,6 +1127,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+        c[C::MarkedPages as usize],
+        mb(c[C::MarkedBytes as usize]),
+        c[C::MarkedKept as usize],
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));

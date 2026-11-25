@@ -1088,6 +1088,34 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_MARKS {
+                        // Ours: the mark entries of the bound heap's views
+                        // (`crate::shadow` "Write marks"). Without one the
+                        // shader could mark anything: the draw is dropped.
+                        let heap = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host());
+                        let Some(table) = heap.and_then(|h| h.marks()) else {
+                            once!("a shader marking its writes without a view heap: dropped");
+                            return false;
+                        };
+                        list.keep(table);
+                        // SAFETY: an open list; the table lives while the
+                        // list holds it.
+                        unsafe {
+                            let gpu = table.GetGPUVirtualAddress();
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1145,6 +1173,23 @@ impl State {
                             } else {
                                 l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                             }
+                        }
+                    }
+                    continue;
+                }
+                if slot == victory_shader::emit::SLOT_VIEW_WRITES {
+                    // Ours: the bitmap shaders mark their written pages in
+                    // (`crate::shadow::copy_back_marks`). Lives for good.
+                    let Some(gpu) = crate::shadow::view_writes() else {
+                        once!("a shader marking its writes without the bitmap: dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the bitmap lives for good.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
                         }
                     }
                     continue;
@@ -1208,7 +1253,9 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                // A root view, not a heap view: no mark entry, so what it
+                // writes is declared.
+                s.gpu_writes(list, a, len, false);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -3254,7 +3301,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                // A view of the heap: writes through it mark their pages
+                // (`crate::shadow::mark_entry`, at the view's table slot).
+                shadow.gpu_writes(list, address, len, true);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

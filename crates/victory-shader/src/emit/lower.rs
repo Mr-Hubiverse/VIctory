@@ -2816,6 +2816,9 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        // Pages written here are copied back as title memory's declared
+        // ranges say, not by view marks.
+        self.s.view_index.remove(&h);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -4036,6 +4039,93 @@ impl<'a> Lower<'a> {
                 phi
             })
             .collect()
+    }
+
+    /// A dword of the raw buffer `h` at byte offset `at`.
+    fn raw_dword(&mut self, h: V, at: V) -> V {
+        let c = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
+    }
+
+    /// The byte stride of the buffer view at heap index `index`, from the
+    /// view-stride table (`t`[`super::shader::SLOT_STRIDES`]).
+    fn stride_at(&mut self, index: V) -> V {
+        let c = self.cur;
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        self.raw_dword(table, at)
+    }
+
+    /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
+    /// buffer view `h` touches, in the lanes `guard` lets through
+    /// (`shader.rs` `SLOT_VIEW_MARKS`): the bits of its first and last byte,
+    /// each set only where still clear. Nothing for handles that are no
+    /// heap buffer view (title memory's, say, or a root view's).
+    fn mark_view_write(&mut self, h: V, x: V, bytes: u32, guard: Option<V>) {
+        let Some(&index) = self.s.view_index.get(&h) else {
+            return;
+        };
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let table = self.s.root_srv_handle(super::shader::SLOT_VIEW_MARKS);
+        let c = self.cur;
+        let (eight, four) = (k(self, 8), k(self, 4));
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
+        let base = self.raw_dword(table, at);
+        let at = self.s.m.bin(c, Bin::Add, at, four);
+        let phase = self.raw_dword(table, at);
+        let none = k(self, super::shader::VIEW_MARK_NONE);
+        let valid = self.s.m.cmp(c, pred::NE, base, none);
+        let active = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, valid),
+            None => valid,
+        };
+        let first = self.s.m.bin(c, Bin::Add, phase, x);
+        let span = k(self, bytes.max(1) - 1);
+        let last = self.s.m.bin(c, Bin::Add, first, span);
+        let (k16, cap) = (k(self, 16), k(self, super::shader::VIEW_WRITE_BITS - 1));
+        let mut bits = Vec::new();
+        for byte in [first, last] {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Add, base, page);
+            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
+            bits.push(self.s.m.select(c, over, cap, n));
+        }
+        let bitmap = self.s.root_uav_handle(super::shader::SLOT_VIEW_WRITES);
+        let outer = self.begin_guarded(Some(active));
+        for (i, &n) in bits.iter().enumerate() {
+            let c = self.cur;
+            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Most writes find their page marked: a load, not an atomic.
+            let old = self.raw_dword(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            if i == 1 {
+                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let inner = self.begin_guarded(Some(clear));
+            let iu = self.s.m.undef(self.s.t.i32);
+            // Operation 2 is OR.
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.end_guarded(inner, &[]);
+        }
+        self.end_guarded(outer, &[]);
     }
 
     /// Code that depends on the lane layout: wave operations, and in compute
@@ -10275,17 +10365,18 @@ impl<'a> Lower<'a> {
                 }
                 self.end_guarded(second, &[]);
             }
+            self.mark_view_write(h, aligned, if bits == 16 { 8 } else { 4 }, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, byte) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu], byte)
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -10293,9 +10384,12 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, s);
+                    let byte = self.s.m.bin(c, Bin::Add, row, off);
+                    (h, [index, off, iu], byte)
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu], off),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10327,6 +10421,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            self.mark_view_write(h, byte, 4, None);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -10356,25 +10451,39 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            // Where the write starts in the view, and how many bytes it may
+            // cover (for its marks).
+            let (byte, bytes);
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                args.push(h);
+                args.extend([element, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                // The element's size is the view's stride (16 bytes at most).
+                (byte, bytes) = match self.s.view_index.get(&h).copied() {
+                    Some(at) => {
+                        let stride = self.stride_at(at);
+                        (self.s.m.bin(self.cur, Bin::Mul, element, stride), 16)
+                    }
+                    _ => (element, 16),
+                };
                 (69, "bufferStore.f32")
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
-                        let byte = self.s.m.bin(c, Bin::Add, index, off);
+                        let b = self.s.m.bin(c, Bin::Add, index, off);
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([byte, iu]);
+                        args.extend([b, iu]);
+                        (byte, bytes) = (b, 4 * count);
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -10383,10 +10492,14 @@ impl<'a> Lower<'a> {
                         }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(c, Bin::Mul, index, s);
+                        (byte, bytes) = (self.s.m.bin(c, Bin::Add, row, off), 4 * count);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        (byte, bytes) = (off, 4 * count);
                     }
                 }
                 args.extend(&vals);
@@ -10400,6 +10513,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.mark_view_write(args[0], byte, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }

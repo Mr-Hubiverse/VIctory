@@ -37,9 +37,11 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    /// Ranges shaders of a submission not yet copied back may be writing
+    /// (title memory there is older than the copy), and whether their
+    /// pages are marked in the written-pages bitmap instead of snapshotted
+    /// ([`Shadow::mark_entry`]).
+    pending: Mutex<Vec<(usize, usize, bool)>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -77,6 +79,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Its first bit in the buffer views' written-pages bitmap, one per
+    /// 64 KiB title page it touches: writes through heap views of it are
+    /// marked there ([`Shadow::mark_entry`], `victory_shader::emit`
+    /// `SLOT_VIEW_MARKS`).
+    marks: Option<u32>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1403,6 +1410,9 @@ impl Drop for Shadow {
             crate::inplace::gone(self.window, self.len);
             return;
         }
+        if let Some(base) = self.marks.take() {
+            marks().give_back(base, pages_of_title(self.start, self.len));
+        }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
@@ -1690,6 +1700,10 @@ impl Shadow {
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        // Nothing is copied: nothing to mark.
+        if let Some(base) = shadow.marks.take() {
+            marks().give_back(base, pages_of_title(start, len));
+        }
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1712,6 +1726,7 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            marks: marks().take(pages_of_title(start, len)),
             buffer,
             data,
             gpu,
@@ -1752,7 +1767,13 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    ///
+    /// `marked`: the shaders mark the 64 KiB pages they write through
+    /// views of this copy (`victory_shader::emit` `SLOT_VIEW_MARKS`): no
+    /// snapshot then, only the pages they marked are compared
+    /// ([`copy_back_marks`]). With `marked`, [`Shadow::writing`] holds the
+    /// copy's whole range, not the view's.
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -1762,7 +1783,45 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+    }
+
+    /// The view-mark entry (`victory_shader::emit` `SLOT_VIEW_MARKS`) of a
+    /// view of this copy whose first byte is at title address `start`: the
+    /// bit of that byte's page and its offset in the page. None where
+    /// writes through it are not marked (not a copy, or in the card's own
+    /// memory): such views declare what they write.
+    pub(crate) fn mark_entry(&self, start: u64) -> Option<(u32, u32)> {
+        if self.place.is_some() || self.card.is_some() {
+            return None;
+        }
+        let base = self.marks?;
+        let page = (start >> 16).checked_sub(self.start >> 16)?;
+        Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether writes through views of this copy are marked and the marks
+    /// can be settled: the write watch (or the guards) must say whether
+    /// the title wrote a page since the copy took it
+    /// ([`Shadow::copy_back_marked`]). Before that is known the declared
+    /// ranges are compared as before.
+    pub(crate) fn marked(&self) -> bool {
+        self.marks.is_some()
+            && self.place.is_none()
+            && self.card.is_none()
+            && self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// The pending ranges declared marked (`crate::host`'s hand-back does
+    /// not compare their offsets: `before` holds nothing for them).
+    pub(crate) fn marked_ranges(&self) -> Vec<(usize, usize)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|r| r.2)
+            .map(|r| (r.0, r.1))
+            .collect()
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -1773,19 +1832,35 @@ impl Shadow {
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// `marked`: the range's shaders mark the pages they write in the
+    /// views' bitmap: nothing is kept, the marked pages alone are compared
+    /// later ([`copy_back_marks`]).
+    pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
         if self.place.is_some() {
             return;
         }
-        let range = (address, address + len);
+        let marked = marked && self.marked();
+        // A marked view may mark pages outside its own range (a write past
+        // it marks the page the byte lands in): the whole copy is pending.
+        let range = if marked {
+            (self.start as usize, (self.start + self.len) as usize, true)
+        } else {
+            (address, address + len, false)
+        };
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
-            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare((range.0, range.1), PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
+            return;
+        }
+        if marked {
+            // No snapshot: which pages the shaders wrote is read from the
+            // bitmap after the submission.
+            pending.push(range);
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
@@ -1797,9 +1872,13 @@ impl Shadow {
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
-        // been refreshed since, and keeps the bytes taken then).
+        // been refreshed since, and keeps the bytes taken then). A marked
+        // range holds no bytes at all, so it is no reason to take less.
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        for &(a, e, marked) in pending.iter() {
+            if marked {
+                continue;
+            }
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -2123,9 +2202,9 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+            pending.retain(|r| !free.contains(&(r.0, r.1)));
         } else {
-            pending.retain(|r| !ranges.contains(r));
+            pending.retain(|r| !ranges.contains(&(r.0, r.1)));
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -2209,8 +2288,8 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|&&(a, e, _)| a < to && e > from)
+            .map(|&(a, e, _)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -2250,13 +2329,13 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
+        let busy: Vec<(usize, usize, bool)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|&&(a, e, _)| a < to && e > from)
+            .map(|&(a, e, m)| (a.max(from), e.min(to), m))
             .collect();
         if busy.is_empty() {
             return false;
@@ -2266,7 +2345,7 @@ impl Shadow {
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
+        for (a, e, marked) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -2299,6 +2378,23 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
+                // A marked range holds no snapshot (`writing`): the title's
+                // bytes go into the copy itself — `copy_back_marked` keeps
+                // them for the pages the title wrote.
+                if marked {
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
+                    // SAFETY: inside the copy's mapping. The card may be
+                    // writing the copy beside these bytes; they are written
+                    // here and nothing around them.
+                    unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), self.data.add(at), n) };
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(n as u64, Ordering::Relaxed);
+                    continue;
+                }
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
@@ -2373,7 +2469,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
+            .map(|&(a, e, _)| (a, e))
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if !busy.is_empty() {
@@ -2939,6 +3035,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
+        own_marks(&shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
@@ -3148,6 +3245,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
+    own_marks(&shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
@@ -3292,4 +3390,283 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// The 64 KiB title pages  touches.
+fn pages_of_title(start: u64, len: u64) -> u32 {
+    let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+    u32::try_from(pages).unwrap_or(u32::MAX)
+}
+
+/// Runs of bits in [], one per 64 KiB title page of a copy
+/// ( ): a free-list by run base,
+/// and by run base the copy that owns it.
+#[derive(Default)]
+struct Marks {
+    /// Free runs, base -> length in bits.
+    free: BTreeMap<u32, u32>,
+    /// The owner of each taken run's first bit.
+    owners: BTreeMap<u32, std::sync::Weak<Shadow>>,
+}
+
+impl Marks {
+    ///  bits, contiguous, or None.
+    fn take(&mut self, pages: u32) -> Option<u32> {
+        if pages == 0 || pages > victory_shader::emit::VIEW_WRITE_BITS {
+            return None;
+        }
+        let (&base, &len) = self.free.iter().find(|(_, len)| **len >= pages)?;
+        self.free.remove(&base);
+        if len > pages {
+            self.free.insert(base + pages, len - pages);
+        }
+        Some(base)
+    }
+
+    /// A run `take` gave back.
+    fn give_back(&mut self, base: u32, len: u32) {
+        self.owners.remove(&base);
+        clear_bits(base, len);
+        // Join with the runs beside it.
+        let mut base = base;
+        let mut len = len;
+        if let Some((&b, &l)) = self.free.range(..base).next_back()
+            && b + l == base
+        {
+            self.free.remove(&b);
+            base = b;
+            len += l;
+        }
+        if let Some((&b, &l)) = self.free.range(base..).next()
+            && base + len == b
+        {
+            self.free.remove(&b);
+            len += l;
+        }
+        self.free.insert(base, len);
+    }
+
+    /// Notes  the owner of the run  it took.
+    fn own(&mut self, base: u32, shadow: &std::sync::Arc<Shadow>) {
+        self.owners.insert(base, std::sync::Arc::downgrade(shadow));
+    }
+
+    /// The copy owning the run  is in, and which bit of the run it
+    /// is (which 64 KiB page of the copy's span).
+    fn owner_of(&self, bit: u32) -> Option<(std::sync::Arc<Shadow>, u32)> {
+        let (&base, owner) = self.owners.range(..=bit).next_back()?;
+        let shadow = owner.upgrade()?;
+        let pages = pages_of_title(shadow.start, shadow.len);
+        let at = bit - base;
+        (at < pages).then_some((shadow, at))
+    }
+}
+
+/// The bit allocator, all of it under one lock.
+static MARKS: Mutex<Marks> = Mutex::new(Marks {
+    free: BTreeMap::new(),
+    owners: BTreeMap::new(),
+});
+
+fn marks() -> std::sync::MutexGuard<'static, Marks> {
+    let mut marks = MARKS.lock().unwrap_or_else(|e| e.into_inner());
+    if marks.free.is_empty() && marks.owners.is_empty() {
+        marks.free.insert(0, victory_shader::emit::VIEW_WRITE_BITS);
+    }
+    marks
+}
+
+/// Gives `shadow` the bit run it took in `Shadow::new`.
+fn own_marks(shadow: &std::sync::Arc<Shadow>) {
+    if let (Some(base), true) = (shadow.marks, shadow.card.is_none()) {
+        marks().own(base, shadow);
+    }
+}
+
+/// Zeroes bits `[base, base + len)` of the bitmap, if it exists: a freed
+/// run's stale bits must not be settled for the copy that takes it next.
+fn clear_bits(base: u32, len: u32) {
+    let Some(bm) = bitmap() else {
+        return;
+    };
+    for bit in base..(base + len).min(victory_shader::emit::VIEW_WRITE_BITS) {
+        // SAFETY: inside the bitmap's whole mapping; a bit set meanwhile
+        // by the card (a submission in the air) may be cleared with the
+        // rest — its page is looked at again at that submission's own
+        // landing.
+        unsafe {
+            let word = bm.data.add(bit as usize / 32);
+            std::ptr::write_volatile(word, std::ptr::read_volatile(word) & !(1 << (bit % 32)));
+        }
+    }
+}
+
+/// The  buffer: a bit per 64 KiB
+/// title page of every copy a view can be made of, set by the shaders
+/// that write through them and read by [] after the
+/// submission lands. Shared memory the card writes and the CPU reads.
+struct Bitmap {
+    /// Kept so the buffer lives.
+    _buffer: ID3D12Resource,
+    gpu: u64,
+    data: *mut u32,
+}
+
+// SAFETY:  points at the buffer's mapping, which lives as long as
+// the buffer (both static once made).
+unsafe impl Send for Bitmap {}
+unsafe impl Sync for Bitmap {}
+
+static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
+
+fn bitmap() -> Option<&'static Bitmap> {
+    BITMAP
+        .get_or_init(|| {
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS) / 8;
+            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            // SAFETY: the buffer's whole new mapping; a live buffer.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            crate::host::name(&buffer, || "view write marks".to_owned());
+            Some(Bitmap { _buffer: buffer, gpu, data: data.cast() })
+        })
+        .as_ref()
+}
+
+/// The bitmap's GPU address ().
+pub(crate) fn view_writes() -> Option<u64> {
+    bitmap().map(|b| b.gpu)
+}
+
+/// After a submission that declared marked writes landed: the pages its
+/// shaders marked, per copy ([`Shadow::copy_back_marked`]). `withheld`
+/// holds the `Arc::as_ptr` of copies a submission still in the air also
+/// declared marked ([`relay`]): their bits stay for its own landing.
+/// Returns (marked pages, bytes put back to title memory, pages kept as
+/// the title's).
+pub(crate) fn copy_back_marks(
+    settle: &std::collections::HashSet<usize>,
+    withheld: &std::collections::HashSet<usize>,
+) -> (u64, u64, u64) {
+    let Some(bm) = bitmap() else {
+        return (0, 0, 0);
+    };
+    let words = victory_shader::emit::VIEW_WRITE_BITS as usize / 32;
+    let (mut pages, mut written, mut kept) = (0u64, 0u64, 0u64);
+    for w in 0..words {
+        // SAFETY: inside the bitmap's whole mapping; the card ORs bits
+        // into it meanwhile, so each word is read once and written back
+        // once with only the bits taken here clear.
+        let mut word = unsafe { std::ptr::read_volatile(bm.data.add(w)) };
+        if word == 0 {
+            continue;
+        }
+        let mut bits = word;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            bits &= bits - 1;
+            let bit = w as u32 * 32 + b;
+            let Some((shadow, page)) = marks().owner_of(bit) else {
+                // A bit of a run since given back: no copy to put back.
+                word &= !(1 << b);
+                continue;
+            };
+            let owner = std::sync::Arc::as_ptr(&shadow) as usize;
+            // Settled are the bits of copies this landing declared marked;
+            // a copy a submission still in the air declared marked keeps
+            // its bits for that landing, and one nobody declared marked
+            // keeps them until a landing does (a stale bit only makes an
+            // extra compare then: what the page holds is the same either
+            // way).
+            if !settle.contains(&owner) || withheld.contains(&owner) {
+                continue;
+            }
+            word &= !(1 << b);
+            let (wrote, keep) = shadow.copy_back_marked(page);
+            pages += 1;
+            written += wrote;
+            kept += u64::from(keep);
+        }
+        // SAFETY: as above; bits set meanwhile are not in `word`.
+        unsafe { std::ptr::write_volatile(bm.data.add(w), word) };
+    }
+    (pages, written, kept)
+}
+
+impl Shadow {
+    /// Title memory the copy spans, `[start, start + len)`.
+    pub(crate) fn title_span(&self) -> (usize, usize) {
+        (self.start as usize, (self.start + self.len) as usize)
+    }
+
+    /// With [`relay`]: how many submissions still in the air declared
+    /// `range` (`Flights`): a marked range of theirs withholds its pages
+    /// from [`copy_back_marks`].
+    pub(crate) fn flights_holding(&self, range: (usize, usize)) -> u32 {
+        self.flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .iter()
+            .filter(|f| f.0 == range)
+            .map(|f| f.1)
+            .sum()
+    }
+
+    /// The submission's shaders marked `page` (the bit's index into the
+    /// copy's run): its copy range goes back to title memory unless the
+    /// title wrote the page since the copy took it — then the title's
+    /// bytes are kept and put in the copy, as a refresh's merge leaves
+    /// them ([`Shadow::merge_under_writes`]). Returns (bytes written to
+    /// title memory, kept).
+    fn copy_back_marked(&self, page: u32) -> (u64, bool) {
+        let start = self.start as usize;
+        let first = start / PAGE;
+        let lo = ((first + page as usize) * PAGE).max(start);
+        let hi = (((first + page as usize) + 1) * PAGE).min(start + self.len as usize);
+        if lo >= hi {
+            return (0, false);
+        }
+        // Whether the title wrote the page since the copy took it: the
+        // write watch, or the guards for view memory (`writes` asks
+        // either); where it cannot say, the title's bytes are kept.
+        let (now, title_wrote) = match crate::watch::writes(lo, hi, true) {
+            Some((now, written)) => {
+                let taken = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    copied.get(page as usize).copied().unwrap_or(0)
+                };
+                let title_wrote = taken == 0 || written.iter().any(|&(p, w)| p == first + page as usize && w > taken);
+                (now, title_wrote)
+            }
+            None => (0, true),
+        };
+        let at = lo - start;
+        let n = hi - lo;
+        let mut title = vec![0u8; PAGE.min(n)];
+        if !crate::host::read_into(lo as *const u8, &mut title[..n]) {
+            // Title memory not there now: left as it is.
+            return (0, false);
+        }
+        // SAFETY: inside the copy's mapping; the submission has run, so
+        // nothing writes these offsets but this.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        if title_wrote {
+            held.copy_from_slice(&title[..n]);
+        } else if held != &title[..n] {
+            crate::watch::writing(lo, n);
+            crate::host::write_mapped(lo as *mut u8, held.as_ptr(), n);
+        }
+        self.changed(at, at + n);
+        // The copy is current with title memory as of this asking.
+        if now != 0 {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = copied.get_mut(page as usize) {
+                *c = now;
+            }
+        }
+        (if title_wrote { 0 } else { n as u64 }, title_wrote)
+    }
 }
