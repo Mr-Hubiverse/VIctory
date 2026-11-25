@@ -5249,6 +5249,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.x.native.stage == HwStage::Ps && super::pops::disables_ordering(inst) {
+            return Ok(());
+        }
         let scc = inst.write(Reg::Scc);
         let dst_code = match dst {
             Some(Operand::Scalar { code, .. }) => Some(*code),
