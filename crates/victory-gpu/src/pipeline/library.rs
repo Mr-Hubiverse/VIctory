@@ -62,6 +62,10 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+pub(super) fn bad_shaders_path() -> Option<PathBuf> {
+    DIR.get().map(|d| d.join("bad_shaders.txt"))
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
