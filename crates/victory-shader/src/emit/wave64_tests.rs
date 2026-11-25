@@ -715,20 +715,20 @@ fn partial_thread_dispatch_on_32_lane_host_emits_wave32_and_masks_wave_counts_an
 }
 
 #[test]
-fn backward_permute_reads_the_other_half_of_a_console_wave() {
+fn backward_permute_stays_inside_each_half_of_a_console_wave() {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
     };
 
     let body = [
-        0x4A04_00A0, // v_add_nc_u32 v2, 32, v0
+        0x4A04_00A1, // v_add_nc_u32 v2, 33, v0
         0x3404_0482, // v_lshlrev_b32 v2, 2, v2
         0xDACC_0000, 0x0100_0002, // ds_bpermute_b32 v1, v2, v0
         0x3406_0082, // v_lshlrev_b32 v3, 2, v0
         0xE070_1000, 0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
     ];
     let mut shaders = Vec::new();
-    for threads in [64, 32] {
+    for threads in [64, 16] {
         let native = native_of(&body, true, threads);
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         for wave in [32, 64] {
@@ -771,7 +771,10 @@ fn backward_permute_reads_the_other_half_of_a_console_wave() {
                 groups: [1, 1, 1],
             },
         ).expect("permute dispatch");
-        let expected = (0..threads).map(|lane| if threads == 64 { lane ^ 32 } else { 0 }).collect::<Vec<_>>();
+        let expected = (0..threads).map(|lane| {
+            let source = (lane & !31) | ((lane + 1) & 31);
+            if source < threads { source } else { 0 }
+        }).collect::<Vec<_>>();
         assert_eq!(out[0], expected, "wave{wave}, {threads} threads");
         eprintln!("wave{wave}, {threads} threads: verified every lane on the GPU");
     }
