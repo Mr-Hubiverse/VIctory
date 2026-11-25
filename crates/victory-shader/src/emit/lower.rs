@@ -100,7 +100,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 pub(super) fn lower_with_thread_limit(parts: &Parts, partial: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, partial).run(partial) {
+        match Lower::new(parts, &bad).run(partial) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -283,6 +283,10 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// A partial (short-group) dispatch's per-lane `active`: the lanes past the title's
+    /// thread count carry no EXEC bit anywhere, but run every block so the group barriers
+    /// a wave64 emulation puts in the code see the whole group (`run`'s `partial`).
+    partial_active: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1264,7 +1268,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, partial: bool) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1318,7 +1322,7 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if !partial && wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1579,6 +1583,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            partial_active: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -2212,9 +2217,10 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
         if partial {
-            // Keep inactive threads out of wave counts, packed-header
-            // reads, and stores. Wave64 emulation through group barriers
-            // requires full participation and cannot run this prologue.
+            // The lanes a short group lacks carry no EXEC bit from here on:
+            // they vote nowhere, guard everything, but still run every block
+            // and every group barrier a wave64 emulation puts in the code, so
+            // the group does not wait on lanes that are not there.
             let original = self.s.entry;
             let width = self.s.threads.expect("compute thread count")[0];
             let limit = self.host_word(RootType::Other(super::USER_DISPATCH_THREADS_X), 0, width);
@@ -2226,12 +2232,7 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
-            let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
-            let body = self.s.m.new_block();
-            let done = self.s.m.new_block();
-            self.s.m.terminate(original, Term::CondBr(active, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            self.partial_active = Some(self.s.m.bin(original, Bin::Or, unlimited, inside));
         }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3650,7 +3651,12 @@ impl<'a> Lower<'a> {
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
         if b == Bool::TRUE || b == Bool::FALSE {
-            return Ok(self.s.m.bool(b == Bool::TRUE));
+            // A partial dispatch's lanes past the title's thread count are in
+            // no mask, not even the unconditional one.
+            return Ok(match (b, self.partial_active) {
+                (Bool::TRUE, Some(a)) => a,
+                (b, _) => self.s.m.bool(b == Bool::TRUE),
+            });
         }
         if let Some(&v) = self.bools.get(&(at, b)) {
             return Ok(v);
@@ -3683,7 +3689,7 @@ impl<'a> Lower<'a> {
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
-        match atom {
+        let v = match atom {
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)
@@ -3739,7 +3745,12 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
-        }
+        };
+        // A lane past a partial dispatch's thread count is in no mask at all.
+        v.map(|v| match self.partial_active {
+            Some(a) => self.s.m.bin(at, Bin::And, v, a),
+            None => v,
+        })
     }
 
     /// A console wave64 program in host waves of 32: the first console thread of this host wave
@@ -4022,7 +4033,9 @@ impl<'a> Lower<'a> {
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
-            None => Ok(None),
+            // An instruction no EXEC narrows is still out of the lanes a
+            // partial dispatch does not have.
+            None => Ok(self.partial_active),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
     }
