@@ -1137,6 +1137,14 @@ static MAPPING: Mutex<Mapping> = Mutex::new(Mapping {
     readers: Vec::new(),
 });
 static WRITER: Mutex<()> = Mutex::new(());
+
+/// Serialize tests that reserve, map, register or remap title memory, or
+/// have the software adapter (WARP) read and write process memory: they
+/// share process-wide state (the shadow registry, the mapping lock, fixed
+/// address ranges), and a WARP access to memory another test has changed is
+/// an access violation in this process. Run together, they crashed it.
+#[cfg(test)]
+pub(crate) static TEST_TITLE_MEMORY_LOCK: Mutex<()> = Mutex::new(());
 static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 const ALL_MEMORY: Range<usize> = 0..usize::MAX;
 
@@ -1885,6 +1893,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();

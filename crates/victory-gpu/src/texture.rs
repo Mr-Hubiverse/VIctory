@@ -1838,6 +1838,7 @@ mod title_memory_tests {
     use super::with_title;
     #[test]
     fn a_texture_refresh_waits_only_for_its_own_mapping() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
         use std::time::{Duration, Instant};
         use windows::core::{IUnknown, Interface};

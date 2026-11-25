@@ -848,6 +848,7 @@ mod tests {
     /// all but the first few read as zeros on the PC this was found on.)
     #[test]
     fn a_replaced_library_file_still_reads_from_the_disk() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);

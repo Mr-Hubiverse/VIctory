@@ -9933,7 +9933,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             std::ptr::write_bytes((start + 3 * PAGE) as *mut u8, 0x33, 64);
         }
         // Mark page 1 as an in-flight shader write.
-        shadow.writing(start + PAGE, 64);
+        shadow.writing(start + PAGE, 64, true);
 
         let list1 = host.new_list().unwrap();
         let list2 = host.new_list().unwrap();

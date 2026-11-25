@@ -1227,6 +1227,7 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1294,6 +1295,7 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
@@ -1426,6 +1428,7 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1636,6 +1639,7 @@ void main() {
     /// clamped, or empty.
     #[test]
     fn warp_large_dispatch_is_made_in_parts() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1790,6 +1794,7 @@ void main() {
 
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1868,6 +1873,7 @@ void main() {
 
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };

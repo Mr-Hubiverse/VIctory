@@ -606,6 +606,7 @@ mod tests {
 
     #[test]
     fn speculation_stops_before_heap_growth_and_confirmed_accesses_can_still_grow() {
+        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::descriptor::{create_srv, host::HostHeap};
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
