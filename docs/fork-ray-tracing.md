@@ -1,8 +1,11 @@
-# Ray tracing in this fork: what the title does and what has been built
+# Ray tracing in DexNom Runtime
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+The experimental ray-tracing path runs in Chapter 1 City on a Radeon RX 7900 XTX.
+A GPU counter on one of the game's traversal shaders recorded finite triangle
+intersections inside the rays' requested distances. This verifies traversal
+against in-game geometry. The lighting result of each pass and the total
+number of bounces still need validation. The normal launcher leaves the
+dynamic structure builder off. [Setup and launch instructions](../README.md)
 
 ## What the title does
 
@@ -35,8 +38,8 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
+1. **The builder programs translate.** All 52 passed validation and created
+   compute pipelines in a separate RX 7900 XTX test. They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
@@ -50,8 +53,7 @@ shaders and emulates the one instruction.
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
    over 311 ray/node cases and compare with the reference bit for bit.
-4. **The trace and shading programs translate** (59 of 64 trace programs, and
-   the irradiance-cache shading program). This needed lane masks treated as
+4. **Traversal and shading use translated compute shaders.** This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
@@ -63,16 +65,17 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- City can take seconds per frame with the builder enabled. Buffer snapshot,
+  comparison and CPU/GPU synchronization account for a substantial part of
+  the measured frame time. See the [benchmark report](../BENCHMARK.md).
+- Five formerly refused shadow compute shaders now create pipelines on the
+  test card. Their visual output still needs verification in the affected scenes.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
+- Individual GPU passes have not been timed separately.
 
 ## Where to look
 

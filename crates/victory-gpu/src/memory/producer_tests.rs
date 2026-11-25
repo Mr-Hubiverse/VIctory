@@ -32,9 +32,9 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
     let heap = HostHeap::new(false, 4).unwrap();
     let source = r#"
         ByteAddressBuffer directory : register(t0);
-        RWByteAddressBuffer pages[1024] : register(u0);
+        RWByteAddressBuffer pages[2048] : register(u0);
         cbuffer Args : register(b0) { uint page; uint offset; uint marker; };
-        [RootSignature("SRV(t0), DescriptorTable(UAV(u0,numDescriptors=1024)), RootConstants(num32BitConstants=3,b0)")]
+        [RootSignature("SRV(t0), DescriptorTable(UAV(u0,numDescriptors=2048)), RootConstants(num32BitConstants=3,b0)")]
         [numthreads(1,1,1)] void main() {
             uint2 entry = directory.Load2(page * 8);
             if (entry.x) pages[entry.x].Store(entry.y + offset, marker);
@@ -56,7 +56,8 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
     let record = |memory: &mut Memory, marker: u32| {
         memory.reconcile().unwrap();
         memory.map(field);
-        let base = heap.raw_page_views(&memory.copies).unwrap();
+        let (base, count) = heap.raw_page_views(&memory.copies).unwrap();
+        assert_eq!(count as usize, memory.copies.len());
         let list = host.new_list().unwrap();
         list.keep(&memory.directory.0);
         let args = [(page / PAGE) as u32, (field - page) as u32, marker];
@@ -78,6 +79,10 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
     crate::shadow::register(old_owner, page, PAGE);
     let retired = crate::shadow::find(field, 1).unwrap();
     let first = record(&mut memory, cpu_pointer);
+    // Fill the first reservation cheaply with views of the same backing.
+    // Rebinding the next owner must grow the run while the first list lives.
+    memory.copies.resize(1023, retired.clone());
+    memory.ranges.resize_with(1023, Vec::new);
     crate::shadow::unregister(old_owner, page);
     crate::shadow::register(new_owner, page, PAGE);
     let current = crate::shadow::find(field, 1).unwrap();
@@ -86,7 +91,7 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
     let second = record(&mut memory, bvh_word);
     memory.update_ranges();
     assert!(memory.ranges[0].is_empty());
-    assert_eq!(memory.ranges[1], [(page, PAGE)]);
+    assert_eq!(memory.ranges[1023], [(page, PAGE)]);
     // Submit only after both generations have recorded their raw writes.
     host.execute(&[&first]);
     host.execute(&[&second]);

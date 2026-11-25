@@ -83,7 +83,11 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cube_lod_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod helper_lane_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -665,6 +669,24 @@ fn widen(
     }
 }
 
+/// The tiled-lighting VS and six eye-lighting PS variants read scalar UINT
+/// masks and indices. These stripped programs have no bitcode or reflected
+/// component types. Bind the observed views by full input digest and exact
+/// root-table field. Other fields in these very shaders hold float textures.
+fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    // DXIL resource kinds 2 = Texture2D, 4 = Texture3D, 10 = TypedBuffer.
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] =
+        &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5 | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8 | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -749,7 +771,7 @@ fn emit_program(
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
             | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
+    let l = lower::lower_program(&parts, box_rehydration, tiled_lighting_uint_srvs(c.digest))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1944,7 +1966,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -1962,6 +1984,14 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    pub(super) fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1987,7 +2017,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -2016,6 +2046,29 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

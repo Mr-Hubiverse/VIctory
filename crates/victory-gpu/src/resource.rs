@@ -1088,6 +1088,9 @@ enum Backing {
     },
     /// Memory the title mapped itself, at this address.
     Address(*mut u8),
+    /// A resource synthesized from a view, without a title resource object.
+    #[cfg(windows)]
+    ViewAddress(*mut u8),
 }
 
 impl Drop for Backing {
@@ -1146,6 +1149,8 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
+    /// Calculated only when a material needs to exclude GPU-owned overlapping memory.
+    guest_end: std::sync::OnceLock<u64>,
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
@@ -1187,8 +1192,18 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+pub(crate) fn writable_texture_overlaps(start: u64, end: u64) -> bool {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    targets.range(..end).rev().any(|(&at, owners)| owners.iter().any(|&object| {
+        let r = resource(object as This);
+        let target_end = r.host.guest_end.get_or_init(|| footprint(&r.desc).map_or(u64::MAX, |f| at.saturating_add(f.size)));
+        *target_end > start
+    }))
+}
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1236,7 +1251,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let other = *targets.get(&(r.data() as u64))?.last()? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1522,6 +1537,29 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
+}
+
+#[cfg(windows)]
+pub(crate) struct ResidentTexture {
+    pub(crate) _gpu: std::sync::Arc<HostTexture>,
+    _title: ResourceRef,
+}
+
+/// Pin the current title and GPU resources without creating either. The
+/// texture registry excludes destruction during the conditional reference.
+#[cfg(windows)]
+pub(crate) fn resident_copy(this: This) -> Option<ResidentTexture> {
+    let registry = textures();
+    if !registry.contains(&(this as usize)) || !object::try_add_ref(this) {
+        return None;
+    }
+    let title = ResourceRef(this as usize);
+    drop(registry);
+    let (gpu, _) = hosted(this, false)?;
+    Some(ResidentTexture {
+        _gpu: gpu,
+        _title: title,
+    })
 }
 
 /// For the card accounting line: whether title texture `this` has a host
@@ -2251,6 +2289,8 @@ impl Resource {
                     .add(offset as usize)
             },
             Backing::Address(at) => at,
+            #[cfg(windows)]
+            Backing::ViewAddress(at) => at,
         }
     }
 }
@@ -2282,6 +2322,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: Hosted {
+            guest_end: Default::default(),
             made: std::sync::Mutex::new(None),
             state,
             // SAFETY: the title passes a whole clear value (the format,
@@ -2300,10 +2341,16 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let address = resource.data() as u64;
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            // The preferred writer stays last: title allocations take precedence over
+            // address-only views. Keep every live alias for its own guest extent.
+            let owners = targets.entry(address).or_default();
+            if matches!(resource.backing, Backing::ViewAddress(_)) {
+                owners.insert(0, at);
+            } else {
+                owners.push(at);
+            }
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2329,8 +2376,9 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
+                if let Some(owners) = targets.get_mut(&at) {
+                    owners.retain(|&object| object != std::ptr::from_ref::<Resource>(self) as usize);
+                    if owners.is_empty() { targets.remove(&at); }
                 }
             }
         }
@@ -2365,7 +2413,7 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
@@ -2508,6 +2556,16 @@ pub(crate) extern "system" fn create_at_address(
         layout,
         "resource at an address"
     );
+    hand_out_address(desc, Backing::Address(address as *mut u8), clear, iid, out)
+}
+
+fn hand_out_address(
+    desc: ResourceDesc,
+    backing: Backing,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     const COMMON: u32 = 0;
     const DEFAULT: HeapProperties = HeapProperties {
         kind: 1,
@@ -2516,16 +2574,7 @@ pub(crate) extern "system" fn create_at_address(
         creation_nodes: 1,
         visible_nodes: 1,
     };
-    hand_out_resource(
-        desc,
-        DEFAULT,
-        0,
-        Backing::Address(address as *mut u8),
-        COMMON,
-        clear,
-        iid,
-        out,
-    )
+    hand_out_resource(desc, DEFAULT, 0, backing, COMMON, clear, iid, out)
 }
 
 /// Textures the title placed in its own memory and views without a
@@ -2636,6 +2685,22 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn placed_key(mut key: [u32; 14]) -> [u32; 14] {
+    // Words 1 and 13 of the description are the filler of its layout
+    // (after the dimension, and at the end): the title leaves there what
+    // its stack held, and two views of one texture that differed only in
+    // them each got a resource and a host copy of their own, on a card
+    // that fills at world entry. They are not part of what a texture is.
+    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    key
+}
+
 /// Holds a title resource and its committed memory or placement heap for a
 /// pending GPU-to-CPU transfer, including lists discarded before submission.
 #[cfg(windows)]
@@ -2672,7 +2737,7 @@ pub(crate) fn writable_texture_at(address: u64, words: &[u32; 14]) -> Option<Res
     }
     let find = || {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-        let target = *targets.get(&address)? as This;
+        let target = *targets.get(&address)?.last()? as This;
         if !object::try_add_ref(target) {
             return Some(None);
         }
@@ -2751,11 +2816,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
+    let made = hand_out_address(
+        d,
+        Backing::ViewAddress(address as *mut u8),
         std::ptr::null(),
         &RESOURCE_IIDS[0],
         &mut out,
@@ -2894,6 +2957,8 @@ extern "system" fn gpu_address(this: This) -> u64 {
             Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
+            #[cfg(windows)]
+            Backing::ViewAddress(_) => "a placed texture view".into(),
         };
         ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
             tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")

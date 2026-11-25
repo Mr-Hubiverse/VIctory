@@ -1281,44 +1281,111 @@ mod relay_tests {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `n` bytes, from the pool if it has one
-/// of about that size: a small copy's snapshot took the 174 MB buffer kept
-/// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+/// Reuse the allocation, never its contents. A raw-address dispatch can retire
+/// hundreds of 4 MiB windows at once. Limiting this pool to eight buffers
+/// discarded already committed pages even when most of the byte budget was free.
+#[derive(Default)]
+struct SnapshotPool {
+    by_capacity: BTreeMap<usize, Vec<Vec<u8>>>,
+    bytes: usize,
+    count: usize,
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+impl SnapshotPool {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        // A tiny snapshot must not monopolize the one large backing needed by a
+        // later heap-wide write. Pick the smallest backing that fits instead.
+        let most = n.saturating_mul(4).max(1 << 20);
+        let (&capacity, bucket) = self.by_capacity.range_mut(n..=most).next()?;
+        let mut buffer = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_capacity.remove(&capacity);
+        }
+        self.count -= 1;
+        self.bytes -= capacity;
+        buffer.clear();
+        Some(buffer)
+    }
+
+    fn put(&mut self, buffer: Vec<u8>) {
+        const MAX_BYTES: usize = 512 << 20;
+        const MAX_COUNT: usize = 512;
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_BYTES {
+            return;
+        }
+        // Prefer to retain the larger, more expensive allocations under pressure.
+        // Equal-sized windows can be discarded directly when the pool is full.
+        while self.count >= MAX_COUNT || self.bytes > MAX_BYTES - capacity {
+            let mut smallest = self.by_capacity.first_entry().expect("nonempty snapshot pool");
+            let size = *smallest.key();
+            if size >= capacity {
+                return;
+            }
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+        self.by_capacity.entry(capacity).or_default().push(buffer);
+        self.bytes += capacity;
+        self.count += 1;
+    }
+}
+
+static POOL: std::sync::LazyLock<Mutex<SnapshotPool>> =
+    std::sync::LazyLock::new(|| Mutex::new(SnapshotPool::default()));
+
+fn pooled(n: usize) -> Vec<u8> {
+    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    reused.unwrap_or_else(|| Vec::with_capacity(n))
+}
+
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).put(v);
+}
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    use super::SnapshotPool;
+
+    #[test]
+    fn a_batch_of_windows_reuses_each_backing_without_reusing_its_contents() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..64 {
+            pool.put(vec![0x6b; 4096]);
+        }
+        let medium = vec![0; 8192];
+        let medium_capacity = medium.capacity();
+        pool.put(medium);
+        let count = pool.count;
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            let buffer = pool.take(4096).unwrap();
+            assert_eq!(buffer.capacity(), 4096);
+            assert!(buffer.is_empty());
+            active.push(buffer);
+        }
+        assert_eq!(pool.count, count - 64);
+        assert_eq!(pool.bytes, medium_capacity);
+        assert!(pool.take(8193).is_none());
+        assert_eq!(pool.take(4097).unwrap().capacity(), medium_capacity);
+        assert_eq!((pool.count, pool.bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_full_pool_replaces_small_buffers_and_bounds_metadata_for_tiny_ones() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..1024 {
+            pool.put(Vec::with_capacity(8));
+        }
+        assert_eq!((pool.count, pool.bytes), (512, 4096));
+        pool.put(Vec::with_capacity(16));
+        assert_eq!((pool.count, pool.bytes), (512, 4104));
+        assert_eq!(pool.take(16).unwrap().capacity(), 16);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2651,7 +2718,7 @@ pub(crate) fn memory() -> [u64; 6] {
     };
     let (kept, kept_bytes) = {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        (pool.count as u64, pool.bytes as u64)
     };
     [
         LIVE[0].load(Ordering::Relaxed),
@@ -4556,6 +4623,21 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// [`exact`] without making one: the copy a slot showing it was made on,
+/// or `None` (`buffer_owner_current` asks; a miss makes nothing).
+pub(crate) fn exact_peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    let now = *tick;
+    let (shadow, used) = map.get_mut(&(address, len))?;
+    *used = now;
+    Some(shadow.clone())
 }
 
 /// With the frame line: the buffer views that got a copy of their own

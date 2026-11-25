@@ -2040,9 +2040,7 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
-    /// Work once the list has run (diagnostics: what read-back buffers
-    /// hold, `HostList::defer_after`).
-    #[cfg(feature = "diagnostics")]
+    /// Work once the GPU has completed the list and its readbacks are visible.
     after: Vec<Box<dyn Fn() + Send>>,
 }
 
@@ -2543,7 +2541,57 @@ fn late_writes() -> bool {
 /// (`victory_shader::emit` `SLOT_VIEW_MARKS`): a marked range holds the
 /// copy's whole span and no snapshot — its pages are compared from the
 /// views' bitmap (`crate::shadow::copy_back_marks`).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>, bool);
+type Declared<T = crate::shadow::Shadow> = (std::sync::Arc<T>, Vec<(usize, usize)>, bool);
+
+/// Keep copies and their ranges in first-declaration order. Only the lookup
+/// uses a hash table. The vector owns an Arc for every indexed address.
+struct WriteGroups<T> {
+    groups: Vec<Declared<T>>,
+    positions: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> WriteGroups<T> {
+    fn new() -> Self {
+        Self { groups: Vec::new(), positions: std::collections::HashMap::new() }
+    }
+
+    fn add(&mut self, shadow: &std::sync::Arc<T>, ranges: &[(usize, usize)], marked: bool) {
+        use std::collections::hash_map::Entry;
+        match self.positions.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+            Entry::Vacant(entry) => {
+                entry.insert(self.groups.len());
+                self.groups.push((shadow.clone(), ranges.to_vec(), marked));
+            }
+            Entry::Occupied(entry) => {
+                let existing = &mut self.groups[*entry.get()];
+                existing.2 |= marked;
+                for range in ranges {
+                    if !existing.1.contains(range) {
+                        existing.1.push(*range);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn shadow_write_groups_preserve_owner_identity_and_first_seen_range_order() {
+    use std::sync::Arc;
+    let first = Arc::new(0);
+    let second = Arc::new(0); // A new backing for the same guest address.
+    let mut writes = WriteGroups::new();
+    writes.add(&first, &[(20, 30), (0, 10)], false);
+    writes.add(&second, &[(0, 10)], false);
+    writes.add(&first.clone(), &[(0, 10), (9, 22), (20, 30)], false);
+    writes.add(&second, &[(0, 10), (20, 30)], false);
+    assert_eq!(writes.groups.len(), 2);
+    assert!(Arc::ptr_eq(&writes.groups[0].0, &first));
+    assert!(Arc::ptr_eq(&writes.groups[1].0, &second));
+    assert_eq!(writes.groups[0].1, [(20, 30), (0, 10), (9, 22)]);
+    assert_eq!(writes.groups[1].1, [(0, 10), (20, 30)]);
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -3158,19 +3206,15 @@ mod fill_check {
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut spans = Batch::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
-                }
+                spans.add(shadow, *address, *len);
             }
         }
     }
@@ -3179,16 +3223,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
-        // runs a frame of a few bytes each, and the cap of 512 settled the
-        // flights twice a frame, 50 ms of the submitting thread.)
-        static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
-        });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let mut runs_left = 512;
+        return spans.refreshes.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans.refreshes.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -3770,11 +3808,13 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
-fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+fn declared_writes(runs: &[&HostList], card_only: bool) -> Vec<Declared> {
+    let mut back = WriteGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len, marked) = step {
+            if let Step::GpuWrite(shadow, address, len, marked) = step
+                && (!card_only || shadow.carded())
+            {
                 // A marked declaration holds the whole copy
                 // (`Shadow::writing`), so that is what is done with at
                 // the copy-back.
@@ -3783,19 +3823,11 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
                 } else {
                     (*address, *address + *len)
                 };
-                match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges, has)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                        *has |= *marked;
-                    }
-                    None => back.push((shadow.clone(), vec![range], *marked)),
-                }
+                back.add(shadow, &[range], *marked);
             }
         }
     }
-    back
+    back.groups
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -3828,6 +3860,9 @@ fn read_backs(list: &HostList) {
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
+    }
+    for work in &list.deferred().after {
+        work();
     }
     for (buffer, at, [row, rows, pitch], source, recorded) in &list.deferred().backs {
         let mut landed = false;
@@ -4461,24 +4496,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len, ..) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        let declared = declared_writes(runs, true);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4510,7 +4528,7 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
-        for (shadow, _) in &declared {
+        for (shadow, ..) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -4663,7 +4681,7 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        for (shadow, ranges, _) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -5251,27 +5269,17 @@ impl Host {
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
                 let owners = writeback_owners(flights.iter().copied());
                 self.relay_card_back(&plans, fetch, behind, landed, &owners);
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = WriteGroups::new();
                 let mut landed: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
                 for flight in &flights {
                     for (shadow, ranges, marked) in &flight.back {
                         if *marked {
                             *landed.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default() += 1;
                         }
-                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all, has)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                                *has |= *marked;
-                            }
-                            None => back.push((shadow.clone(), ranges.clone(), *marked)),
-                        }
+                        back.add(shadow, ranges, *marked);
                     }
                 }
-                relay_hand_back(&back, &owners, &landed);
+                relay_hand_back(&back.groups, &owners, &landed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -5717,7 +5725,7 @@ impl Host {
                     _ => None,
                 }));
                 let mut seen = std::collections::HashSet::new();
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = WriteGroups::new();
                 let mut landed: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
@@ -5730,20 +5738,10 @@ impl Host {
                         if *marked {
                             *landed.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default() += 1;
                         }
-                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all, has)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                                *has |= *marked;
-                            }
-                            None => back.push((shadow.clone(), ranges.clone(), *marked)),
-                        }
+                        back.add(shadow, ranges, *marked);
                     }
                 }
-                hand_back(&back, &owners, &landed);
+                hand_back(&back.groups, &owners, &landed);
                 copy_back(0, copying.elapsed().as_micros() as u64);
             }
             // In the order given: what tells the title the card is done.
@@ -5935,7 +5933,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            let back = declared_writes(runs);
+            let back = declared_writes(runs, false);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
@@ -6065,7 +6063,7 @@ impl Host {
                 &owners,
             );
         }
-        let back = declared_writes(runs);
+        let back = declared_writes(runs, false);
         // One submission, waited for: nothing in the air withholds marks.
         hand_back(&back, &owners, &std::collections::HashMap::new());
         crate::writeback::published(this_submission);
@@ -6695,6 +6693,59 @@ impl HostList {
         true
     }
 
+    /// Before a draw or dispatch binds anything: every depth texture with a
+    /// stencil plane whose depth plane's twin an earlier draw or dispatch of
+    /// this list wrote (the tiled lighting's compute writes each pixel's
+    /// material class there) gets the stencil twin copied and the depth
+    /// plane's twin drawn into the plane now, not when the list closes.
+    /// That shortcut of `twin_use` left the shaders that read the classes
+    /// back in the same list (as a texture: run pn1 saw no such depth
+    /// target) with the classes of the frame before, about once a frame.
+    /// Done for whatever comes next, also a dispatch that writes the twin
+    /// again (a pass more, never a wrong one): which textures a draw reads
+    /// is known only while its tables are made, after its pipeline is set.
+    /// True if a pass was recorded: it set a descriptor heap, graphics root
+    /// signature, pipeline, depth target, viewport, scissor and topology of
+    /// its own, and the caller sets the title's again
+    /// (`State::after_our_pass`). `VICTORY_PLANE_NOW=0` keeps the old way.
+    pub(crate) fn planes_now(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_none_or(|v| v != "0")) {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() {
+            return false;
+        }
+        let due: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.behind[0] == Some(true) && u.twin.plane.is_some())
+            .map(|u| {
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone())
+            })
+            .collect();
+        drop(twins);
+        for (depth, twin) in &due {
+            self.twin_copy(depth, twin, false);
+            self.pass_plane(depth, twin);
+            // A shader may read this by a heap index without binding an
+            // explicit view. Hand the plane back in the same readable
+            // state as twins_to_depth does at the end of a list.
+            let readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            self.settle(depth, readable.0 as u32);
+        }
+        if !due.is_empty() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!("depth planes written by shaders are drawn into the plane before the next draw or dispatch, not when the list closes (VICTORY_PLANE_NOW=0: as before)");
+            });
+        }
+        !due.is_empty()
+    }
+
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
@@ -7182,8 +7233,7 @@ impl HostList {
     }
 
     /// Runs `work` once the list has run, with its read-backs
-    /// (diagnostics: logging what a read-back buffer of ours holds).
-    #[cfg(feature = "diagnostics")]
+    /// Use this for readback results that are consumed after GPU completion.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
     }
@@ -8527,7 +8577,7 @@ impl Meter {
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                     {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                     {} ranges of memory mapped, unmapped or written under texture views ({} full-queue rescans), {} slots made due by them, \
                      {} made slots found unmapped and made null",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),

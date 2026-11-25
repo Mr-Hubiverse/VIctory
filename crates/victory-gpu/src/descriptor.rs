@@ -309,13 +309,13 @@ fn changed_slots(
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32, discarded: bool) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(first, n, discarded);
     }
 }
 
@@ -920,6 +920,17 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// A slot named indirectly by a material may be in the reserved, uncommitted part of a heap.
+#[cfg(windows)]
+pub(crate) fn checked_view(handle: u64) -> Option<View> {
+    let mut bytes = [0u8; 12];
+    if handle == 0 || !crate::host::read_into(handle as *const u8, &mut bytes) {
+        return None;
+    }
+    let word = |i: usize| u32::from_le_bytes(bytes[i..i+4].try_into().unwrap());
+    (word(0) == VIEW_TAG).then(|| view_at(word(4), word(8))).flatten()
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.
@@ -1341,6 +1352,202 @@ mod tests {
         create_srv(null, null, null.cast(), slot(2));
         assert_eq!(contents(), [6, 0, 0, tlas + 256, 0, 0, base + 8, 0]);
         assert_eq!(&*gpu.acceleration_addresses(), &[tlas + 256]);
+        assert_eq!(release(object), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn material_demand_revives_only_current_free_mips_and_protects_aliases() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let Some(_) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut object = null;
+        assert_eq!(create(HeapDesc { kind: 0, count: 8, flags: 1, nodes: 0 }, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let heap = heap(object);
+        let host = heap.host().unwrap();
+        let color = [3, 0, 0, 0, 1024, 0, 512, 0x8_0001, 72, 1, 0, 0x105, 0, 0];
+        let small = crate::resource::placed_bytes_from(&color, 4).unwrap();
+        let mut writer = color;
+        writer[8] = 28;
+        writer[12] = 1;
+        let writer_bytes = crate::resource::placed_bytes(&writer).unwrap();
+        // The cached writer and sampled views retain these addresses for the process lifetime.
+        // SAFETY: reserve the writer's entire footprint and place each view inside that allocation.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), writer_bytes.try_into().unwrap(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as u64;
+        assert_ne!(base, 0);
+        let addr = base + small;
+        let put = |slot, at: u64, first: u32| {
+            let mut srv = [0u32; 16];
+            srv[0] = 72;
+            srv[1] = 4;
+            srv[2] = 5768;
+            srv[4] = first;
+            srv[5] = 8 - first;
+            srv[10] = at as u32;
+            srv[11] = (at >> 32) as u32;
+            let mut shape = color;
+            if slot == 2 { shape[4] = 2048; }
+            let bytes = crate::resource::placed_bytes_from(&shape, first).unwrap();
+            assert!(base <= at && at + bytes <= base + writer_bytes);
+            create_placed_srv(null, &shape, &srv, heap.handle(slot).unwrap());
+        };
+        let _frame_guard = crate::frame::TEST_FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        let clear = |s| create_cbv(null, &[0x400, 6, 256, 0], heap.handle(s).unwrap());
+        put(1, addr, 4);
+        let stamp = host.material_write_stamp();
+        put(2, addr, 1);
+        assert!(host.demand_material_texture(heap, 1, stamp, frame).is_none(), "a different current owner");
+        clear(2);
+        assert!(small < crate::resource::placed_bytes(&color).unwrap());
+        put(3, addr + small, 0); // touches the nominal interval, starts after the visible mips
+        let revived = host.demand_material_texture(heap, 1, stamp, frame).unwrap();
+        assert!(host.texture_slots_due(frame, 8).0.contains(&revived));
+        assert!(host.material_upload_allowed(1, revived.1, addr, small, small));
+        assert!(!host.material_upload_allowed(1, revived.1, addr, small, small - 1));
+        let srv = host.mirror(1, heap.handle(1).unwrap(), true).unwrap();
+        let live = host::placed_texture(&srv).unwrap();
+        let View::Shader(texture, _) = live.view else { panic!("no sampled texture") };
+        let gpu = crate::resource::host_resource(texture as This).unwrap();
+        assert_eq!(host.shows(1, gpu), Some(true));
+
+        // Replacing the selection and writing the original bytes back still creates a new generation.
+        clear(1);
+        put(1, addr, 4);
+        assert!(host.demand_material_texture(heap, 1, stamp, frame).is_none());
+        let new_stamp = host.material_write_stamp();
+        put(2, addr, 1);
+        clear(2);
+        // A copied/renderable texture starting earlier can overlap the view.
+        let _writer = crate::resource::texture_at(base, &writer).unwrap();
+        assert!(host.demand_material_texture(heap, 1, new_stamp, frame).is_none(), "GPU-writable owner");
+        assert_eq!(release(object), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn material_demand_keeps_overlapping_gpu_owners_until_each_is_released() {
+        use windows::core::{Interface, IUnknown};
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: these private pages belong to the test until both title objects are released.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 2 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let base = memory as u64;
+        let owner = |side: u32| {
+            let words: [u32; 14] = [3, 0, 0, 0, side, 0, side, 0x1_0001, 28, 1, 0, 0x105, 1, 0];
+            // SAFETY: the 14 words have the guest resource description's exact layout.
+            let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+            let mut raw = std::ptr::null();
+            assert_eq!(crate::resource::create_at_address(std::ptr::null(), base, &desc, 0,
+                std::ptr::null(), &crate::resource::PAGEABLE_IIDS[0], &mut raw), S_OK);
+            crate::texture::host_written(raw);
+            // SAFETY: adopt the title resource's initial reference, using its own vtable.
+            unsafe { IUnknown::from_raw(raw.cast_mut().cast()) }
+        };
+        let large = owner(512);
+        let small = owner(32);
+        let range = (base + 512 * 1024, base + 516 * 1024);
+        let check = |expected| {
+            assert_eq!(crate::resource::writable_texture_overlaps(range.0, range.1), expected);
+            assert_eq!(crate::texture::host_written_overlaps(range.0, range.1), expected);
+        };
+        check(true);
+        drop(small);
+        check(true);
+        drop(large);
+        check(false);
+        // SAFETY: both resource references have been released.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn material_demand_follows_gpu_record_and_rejects_reused_texture_memory() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(device) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut object = null;
+        assert_eq!(create(HeapDesc { kind: 0, count: 128, flags: 1, nodes: 0 }, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let heap = heap(object);
+        let host = heap.host().unwrap();
+        let source_slot = 688 * 4 / 32;
+        let record_bytes = [0u64; 8];
+        let base = record_bytes.as_ptr() as u64;
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 64;
+        let mut view = [0; 16];
+        view[0] = 41;
+        view[1] = 1;
+        view[6] = 16;
+        view[10] = base as u32;
+        view[11] = (base >> 32) as u32;
+        let handle = heap.handle(source_slot).unwrap();
+        create_placed_srv(null, &resource, &view, handle);
+        let material = host.mirror(source_slot, handle, true).unwrap();
+        let (shadow, address, _) = host::buffer_copy(&material).unwrap();
+        let backing = vec![0u8; 1<<20];
+        let addr = backing.as_ptr() as u64;
+        let tex = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut tex_view = [0; 16];
+        tex_view[10] = addr as u32;
+        tex_view[11] = (addr >> 32) as u32;
+        create_placed_srv(null, &tex, &tex_view, heap.handle(3).unwrap());
+        let _frame_guard = crate::frame::TEST_FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        let stamp = host.material_write_stamp();
+        let write = host.demand_material_texture(heap, 3, stamp, frame).unwrap();
+        let list = device.new_list().unwrap();
+        // Two typed BC1_UNORM detail maps exactly like the City shader's G+0x10/G+0x14.
+        // Overlapping newer views remove their initial host entries; clearing the
+        // newer slots leaves both address ranges free and the original views null.
+        for (slot, at, width, height, levels, first) in [
+            (5, addr + 0x40000, 512, 256, 7, 1), (6, addr + 0x60000, 1024, 512, 8, 3),
+        ] {
+            let mut shape = [3, 0, 0, 0, width, 0, height, (levels << 16) | 1, 71, 1, 0, 0x105, 0, 0];
+            let mut srv = [0u32; 16];
+            srv[0] = 71;
+            srv[1] = 4;
+            srv[2] = 5768;
+            srv[4] = first;
+            srv[5] = levels - first;
+            srv[10] = at as u32;
+            srv[11] = (at >> 32) as u32;
+            create_placed_srv(null, &shape, &srv, heap.handle(slot).unwrap());
+            shape[4] *= 2;
+            create_placed_srv(null, &shape, &srv, heap.handle(8).unwrap());
+            create_cbv(null, &[0x400, 6, 256, 0], heap.handle(8).unwrap());
+        }
+        let words = [0xf800_0003u32, 0, 7, 0, 5, 6];
+        let bytes = std::mem::size_of_val(&words) as u64;
+        let (upload, mapped) = device.upload_buffer(bytes).unwrap();
+        // SAFETY: copy the full upload allocation into the owned material range.
+        // CPU memory for all six words stays zero; the selected values exist only on the GPU.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped, bytes as usize);
+            list.list.CopyBufferRegion(&shadow.buffer, shadow.offset(address), &upload, 0, bytes);
+            list.list.ResourceBarrier(&[crate::host::transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        crate::material_demand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
+        list.close();
+        device.execute(&[&list]);
+        let mut due: Vec<_> = (32..48).map(|n| (n,1,false)).collect();
+        due.push(write);
+        let wanted = host.material_demand.take(heap, host, frame);
+        assert_eq!(wanted.iter().map(|&(slot, _, recovered)| (slot, recovered)).collect::<Vec<_>>(),
+            [(3, false), (5, true), (6, true)]);
+        assert_eq!(record_bytes, [0; 8]);
+        crate::material_demand::promote(&mut due, &wanted, frame);
+        assert_eq!(due[(frame % 4) as usize], write);
+        assert_eq!(record_bytes[0], 0);
+        let mut newer = tex;
+        newer[4] = 128;
+        create_placed_srv(null, &newer, &tex_view, heap.handle(4).unwrap());
+        assert!(host.demand_material_texture(heap, 3, stamp, frame).is_none());
+        assert!(host.demand_material_texture(heap, 4, stamp, frame).is_none());
+        assert!(host.demand_material_texture(heap, 4, host.material_write_stamp(), frame).is_some());
         assert_eq!(release(object), 0);
     }
 

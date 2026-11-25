@@ -48,7 +48,8 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || heavy_listed(n)
+    named || REQUESTED_FRAME.load(std::sync::atomic::Ordering::Relaxed) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || heavy_listed(n)
 }
 
 /// `VICTORY_CAPTURE_HEAVY_FRAMES` (comma-separated): frames counted from
@@ -194,10 +195,20 @@ fn world_every() -> u64 {
 
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static REQUESTED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    static REQUEST: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static LAST_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(path) = REQUEST.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_REQUEST").map(PathBuf::from))
+        && let Some(request) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+        && request != 0 && request != LAST_REQUEST.swap(request, Relaxed)
+    {
+        REQUESTED_FRAME.store(frame + 1, Relaxed);
+        tracing::info!(frame = frame + 1, request, "requested material frame capture");
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static LAST_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let attempted = crate::draw::attempted();

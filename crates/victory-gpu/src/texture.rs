@@ -598,12 +598,12 @@ pub(crate) fn host_written(resource: This) {
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
-        let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+        let bytes = crate::resource::placed_bytes(&words).unwrap_or(u64::MAX);
         if !at.is_null() && bytes > 0 {
             HOST_WRITTEN_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+                .insert((at as u64, resource as usize), (bytes, words[4], words[6], words[7], words[8]));
         }
     }
 }
@@ -611,8 +611,13 @@ pub(crate) fn host_written(resource: This) {
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
-static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<(u64, usize), (u64, u32, u32, u32, u32)>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn host_written_overlaps(start: u64, end: u64) -> bool {
+    let writes = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    writes.range(..(end, 0)).rev().any(|(&(base, _), entry)| base.saturating_add(entry.0) > start)
+}
 
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host
@@ -623,12 +628,13 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.range(..=address)
-            .next_back()
-            .filter(|(at, d)| address < **at + d.0)
-            .map(|(at, d)| (*at, *d))
+        map.range(..=(address, usize::MAX)).next_back().and_then(|(&(at, _), _)| {
+            map.range((at, 0)..=(at, usize::MAX)).find_map(|(_, &d)| {
+                (address < at.saturating_add(d.0)).then_some((at, d))
+            })
+        })
     };
-    if let Some((at, (bytes, width, height, layers_levels, format, _))) = hit {
+    if let Some((at, (bytes, width, height, layers_levels, format))) = hit {
         static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::warn!(
@@ -662,18 +668,14 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 }
 
 /// The title released a resource.
-pub(crate) fn forget(resource: usize) {
+pub(crate) fn forget(resource: usize, address: u64) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    if HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|set| set.remove(&resource)) {
+        HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address, resource));
     }
-    // Its memory may be given to other textures now (run 177: most of the
-    // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
@@ -1508,20 +1510,20 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// one not there. A texture can also have only interior mips present while
+/// streaming. Windows can skip each uncommitted run in a single query.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    if len == 0 {
-        return 0;
-    }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if start == end {
         return 0;
     }
-    if !by_query() {
+    let query = by_query();
+    let ends_missing = !query && !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    if ends_missing && (end - 1) / 4096 - start / 4096 <= 1 {
+        return 0;
+    }
+    if !query && !ends_missing {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1548,6 +1550,25 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
+    mapped_regions(start, end, false)
+}
+
+/// The sweep only needs to discover whether a texture has any data to stage.
+pub(crate) fn any_mapped(start: usize, len: usize) -> bool {
+    let end = start.saturating_add(len);
+    if start == end {
+        return false;
+    }
+    if committed(start as *const u8, 1) {
+        return true;
+    }
+    (end - 1) / 4096 > start / 4096 && mapped_regions(start, end, true) > 0
+}
+
+fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1558,8 +1579,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
             there += (next - p) as u64;
+            if first_only {
+                break;
+            }
         }
         p = next;
     }
@@ -1711,6 +1735,84 @@ mod first_mip_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+    #[test]
+    fn a_texture_refresh_waits_only_for_its_own_mapping() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+        use std::time::{Duration, Instant};
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::*;
+
+        if crate::host::host().is_none() {
+            return; // no D3D12 device
+        }
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: a known title texture description. These private pages are
+        // committed and live until its resource and staging have been released.
+        let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+        let page = 64 << 10;
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let at = memory as usize;
+        unsafe { memory.cast::<u8>().write_bytes(0x57, 2 * page) };
+        let mut title = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(std::ptr::null_mut(), at as u64, &desc,
+            0, std::ptr::null(), &crate::resource::PAGEABLE_IIDS[0], &mut title), 0);
+        // SAFETY: take ownership of the resource's initial COM reference.
+        let owner = unsafe { IUnknown::from_raw(title.cast_mut().cast()) };
+        let host = crate::resource::host_copy(title).unwrap();
+        let staging = super::staging(title, &host.texture, 0).unwrap();
+        assert!(staging.size <= page);
+        for (range, overlapping) in [(at + page..at + 2 * page, false), (at..at + page, true)] {
+            *staging.last.lock().unwrap() = super::Last::default();
+            let finished = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let (started, ready) = mpsc::channel();
+                let finished = &finished;
+                s.spawn(move || {
+                    let _writer = crate::watch::title_memory_remapping_range(range);
+                    started.send(()).unwrap();
+                    std::thread::sleep(Duration::from_secs(1));
+                    finished.store(true, Ordering::Release);
+                });
+                ready.recv().unwrap();
+                let start = Instant::now();
+                assert_eq!(staging.refresh_timed(), staging.size);
+                eprintln!("texture refresh, overlap={overlapping}: {:?}", start.elapsed());
+                assert_eq!(finished.load(Ordering::Acquire), overlapping && !super::no_wait());
+                // SAFETY: the first texel has been staged, and nothing is writing it.
+                assert_eq!(unsafe { *staging.data }, 0x57);
+            });
+        }
+        drop(staging);
+        drop(host);
+        drop(owner);
+        crate::watch::title_memory_remapped(at, 2 * page);
+        // SAFETY: no remaining resource, reader, or writer uses this reservation.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn a_texture_with_only_interior_pages_counts_its_resident_bytes() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: this private reservation is ours throughout the test.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert_eq!(super::mapped_bytes(base, 5 * BLOCK), BLOCK as u64);
+            assert!(super::any_mapped(base as usize, 5 * BLOCK));
+            assert_eq!(super::mapped_bytes(base.add(BLOCK - 3), 2 * BLOCK + 9), BLOCK as u64);
+            assert_eq!(super::mapped_bytes(base, 2 * BLOCK), 0);
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
+            assert!(!super::any_mapped(base as usize, 5 * BLOCK));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

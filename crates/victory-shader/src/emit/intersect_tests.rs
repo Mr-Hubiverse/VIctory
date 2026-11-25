@@ -167,12 +167,18 @@ fn build(
 
 fn build_words(words: &[u32]) -> Result<(HostShader, resource::Resources), ShaderError> {
     let native = native(words);
+    build_compute_shader(&native)
+}
+
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -744,12 +750,12 @@ fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
     assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
     assert!(shader.root_cbvs.is_empty());
     let mut constants = vec![0; shader.user_data_dwords() as usize];
-    let base = shader
-        .user_data
-        .iter()
-        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
-        .unwrap();
-    constants[base.index as usize] = MEMORY_BASE;
+    for (dword, value) in [(0, MEMORY_BASE), (1, 3)] {
+        let word = shader.user_data.iter().find(|u|
+            u.root == RootType::Other(super::USER_MEMORY_BASE) && u.dword == dword
+        ).unwrap();
+        constants[word.index as usize] = value;
+    }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -839,6 +845,12 @@ fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
         );
         assert_eq!(split_box[3][fault_slot], page as u32 + 1);
         let mut recovered = directory.clone();
+        // Another recording thread mapped this page after our descriptor
+        // run was bound. The old bind must fault without indexing that slot.
+        recovered[(page + 1) * 2] = 1024;
+        let beyond = dispatch(&[Some((0, 5, through_origin))], PAGE + 0x10000 - 64, &recovered);
+        assert_eq!(beyond[0][..4], split_box[0][..4]);
+        assert_eq!(beyond[3][fault_slot], page as u32 + 1);
         recovered[(page + 1) * 2] = 3; // separate host buffer for the remaining bounds
         let retried = dispatch(
             &[Some((0, 5, through_origin))],

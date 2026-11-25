@@ -26,10 +26,11 @@
 //! the next frame. For the structure builder that is the same as a dropped
 //! stage, so before a dispatch the host makes ready everything it can see
 //! the dispatch name: the whole copy around each root view, around each
-//! pair of root constants that is a title address and around each root
-//! constant that is one in 256-byte units (the builder passes structures
-//! all three ways), and the 4 MiB after each (a structure may cross a
-//! window's end).
+//! pair of shader-visible root constants that is a title address and around
+//! each such constant that is one in 256-byte units (the builder passes
+//! structures all three ways). A structure may cross a window's end, so
+//! roots also name the next cell, and constant candidates do when their own
+//! page exists.
 //! shortcut: what a stage reaches only through pointers it reads out of
 //! memory (InitHeaders' table of structure addresses, LoadInstances'
 //! instance records) is only made ready if another source names it. A
@@ -40,13 +41,11 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
-//! dirty-page mask written by the shader would bound both.
+//! each view heap grows its descriptor run as more copies are needed.
+//! Reads see all addressable copies. Writers publish all visible copies unless
+//! the direct builder's bound constants identify every possible raw store.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,13 +59,13 @@ use crate::shadow::Shadow;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod ray_probe;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-pub(crate) const COPIES: u32 = 1023;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+// Slot zero is the null descriptor. Only real addresses may grow the first
+// run; a scalar or a neighbor guess must not retain another 4 MiB window.
+const SPECULATIVE_COPIES: usize = crate::descriptor::host::FIRST_RAW_PAGE_SLOTS as usize - 1;
 
 // A title may register buffers while another thread is recording GPU work.
 // Record only the changed spans. A lagging reader that misses journal history
@@ -99,12 +98,53 @@ fn page_byte(page: u64, start: u64, len: u64, prefix: u64) -> Option<u32> {
     Some(byte as u32)
 }
 
+/// Which bytes a shader can change through the raw directory. An exact
+/// declaration contains at most the builder header and a centroid box.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Writes {
+    None,
+    All,
+    Ranges([(u64, u64); 2]),
+}
+
+impl Writes {
+    /// Visit the parts of each declaration addressable by the shader. The
+    /// lookup masks the high dword to 8 bits, and its clamped last directory
+    /// entry is always a null UAV. Split at each page, including 40-bit wrap.
+    fn pages(&self, mut visit: impl FnMut(u64, u64)) {
+        const MASK: u64 = (1 << 40) - 1;
+        let Self::Ranges(ranges) = self else { return };
+        for &(address, mut len) in ranges {
+            let mut at = address & MASK;
+            while len != 0 {
+                let part = len.min(PAGE - at % PAGE);
+                if at / PAGE < u64::from(MEMORY_PAGES - 1) {
+                    visit(at, part);
+                }
+                at = (at + part) & MASK;
+                len -= part;
+            }
+        }
+    }
+
+    fn owned(&self, pages: &BTreeMap<u64, usize>, mut visit: impl FnMut(usize, u64, u64)) {
+        self.pages(|at, len| {
+            if let Some(&owner) = pages.get(&(at / PAGE)) {
+                visit(owner, at, len);
+            }
+        });
+    }
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Shadow IDs are unique for the lifetime of a backing, including after
+    /// the guest reuses its address.
+    numbers: HashMap<u64, usize>,
     pages: BTreeMap<u64, usize>,
     ranges: Vec<Vec<(u64, u64)>>,
     recalculate: BTreeSet<usize>,
@@ -116,6 +156,16 @@ struct Memory {
     refused: std::collections::HashSet<u64>,
     /// Typed locations already considered for this heap snapshot this frame.
     acceleration: Option<Arc<[u64]>>,
+    /// What first caused each copy to receive a descriptor. Replacements
+    /// during reconciliation account for the remainder.
+    from_roots: usize,
+    from_neighbors: usize,
+    from_constants: usize,
+    from_faults: usize,
+    speculative_skips: u64,
+    /// A speculative expansion can stop mid-buffer once, when the initial
+    /// slots fill. A subsequent confirmed access completes that expansion.
+    partial_copy: Option<usize>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -130,6 +180,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Last numbered copy this draw prepared. Other recording threads can
+    /// subsequently add mappings to the same directory.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -144,6 +197,7 @@ impl Memory {
             directory: Self::table(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: Self::table(u64::from(fault_dwords), "faults")?,
             copies: Vec::new(),
+            numbers: HashMap::new(),
             pages: BTreeMap::new(),
             ranges: Vec::new(),
             recalculate: BTreeSet::new(),
@@ -152,6 +206,12 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             acceleration: None,
+            from_roots: 0,
+            from_neighbors: 0,
+            from_constants: 0,
+            from_faults: 0,
+            speculative_skips: 0,
+            partial_copy: None,
         })
     }
 
@@ -184,14 +244,12 @@ impl Memory {
     /// Assign stable slots. A previously recorded list may still reference any
     /// old slot, even after the corresponding guest address has been reused.
     fn number(&mut self, shadow: &Arc<Shadow>) -> Option<usize> {
-        if let Some(index) = self.copies.iter().position(|copy| Arc::ptr_eq(copy, shadow)) {
+        if let Some(&index) = self.numbers.get(&shadow.id()) {
             return Some(index);
         }
-        if self.copies.len() == COPIES as usize {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
-            return None;
-        }
+        // The directory stores a one-based u32 slot; zero is the null view.
+        u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
+        self.numbers.insert(shadow.id(), self.copies.len());
         self.copies.push(shadow.clone());
         self.ranges.push(Vec::new());
         Some(self.copies.len() - 1)
@@ -281,49 +339,78 @@ impl Memory {
         }
     }
 
-    /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// Makes the page of `address` available and reports whether it has a copy.
+    fn map(&mut self, address: u64) -> bool {
+        self.map_page(address, false)
+    }
+
+    fn map_page(&mut self, address: u64, speculative: bool) -> bool {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return false;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
+        let slot = unsafe { entry.read() };
+        if slot != 0 {
+            let index = slot as usize - 1;
+            if !speculative && self.partial_copy == Some(index) {
+                self.coverage_revision += 1;
+                self.populate(index, false);
+            }
+            return true;
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return false;
+        }
+        if speculative && self.copies.len() >= SPECULATIVE_COPIES {
+            // Do not call page_owner: it can allocate a shadow immediately.
+            // Leave the page eligible for a later root, AS descriptor or fault.
+            self.speculative_skips += 1;
+            return false;
         }
         let Some((shadow, offset)) = Self::page_owner(start) else {
             self.refused.insert(page);
-            return;
+            return false;
         };
         let count = self.copies.len();
-        let Some(n) = self.number(&shadow) else { return };
+        let Some(n) = self.number(&shadow) else { return false };
         if n < count {
             // An existing copy regained a page that earlier binds did not cover.
             self.coverage_revision += 1;
-            self.set_page(page, Some((n, offset)));
-            return;
         }
+        self.set_page(page, Some((n, offset)));
+        if n == count || (!speculative && self.partial_copy == Some(n)) {
+            self.populate(n, speculative);
+        }
+        true
+    }
+
+    fn populate(&mut self, index: usize, speculative: bool) {
         // A builder can follow an indirect address to any full page in this
         // buffer. Prefer a nested resource already registered at that page.
-        let (first, len) = shadow.span();
+        let (first, len) = self.copies[index].span();
         let end = (first + len) / PAGE;
+        if self.partial_copy == Some(index) {
+            self.partial_copy = None;
+        }
         for p in first.div_ceil(PAGE)..end.min(u64::from(MEMORY_PAGES) - 1) {
             if self.pages.contains_key(&p) {
                 continue;
             }
-            if p == page {
-                self.set_page(p, Some((n, offset)));
-            } else if let Some((owner, off)) = Self::page_owner(p * PAGE)
+            // A nested resource in this span may need its own copy. At the
+            // speculation limit leave other pages for a confirmed access.
+            if speculative && self.copies.len() >= SPECULATIVE_COPIES {
+                self.speculative_skips += 1;
+                self.partial_copy = Some(index);
+                break;
+            }
+            if let Some((owner, off)) = Self::page_owner(p * PAGE)
                 && let Some(number) = self.number(&owner)
             {
                 self.set_page(p, Some((number, off)));
@@ -357,16 +444,30 @@ impl Memory {
                 );
             }
         }
+        let before = self.copies.len();
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }
+        self.from_faults += self.copies.len() - before;
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
+        let before = self.copies.len();
         self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        let after_root = self.copies.len();
+        self.from_roots += after_root - before;
+        self.map_page((address & !(CELL - 1)) + CELL, true);
+        self.from_neighbors += self.copies.len() - after_root;
+    }
+
+    fn name_constant(&mut self, address: u64) {
+        // A scalar that happens to precede a live allocation does not
+        // establish that the shader uses any part of that allocation.
+        if self.map_page(address, true) {
+            self.map_page((address & !(CELL - 1)) + CELL, true);
+        }
     }
 
     /// A null-resource acceleration-structure SRV supplies a definite guest
@@ -384,10 +485,13 @@ impl Memory {
     }
 
     fn prepare_addresses(&mut self, heap: &HostHeap, addresses: &[u64], constants: &[u32]) {
+        let before = self.copies.len();
         self.map_acceleration_structures(heap);
+        self.from_roots += self.copies.len() - before;
         for &address in addresses {
             self.name(address);
         }
+        let after_roots = self.copies.len();
         // A title address in two constants (low dword, then bits 32 to 39), or
         // in one in 256-byte units. A constant that only looks like one names
         // memory nothing reads; one that is not the title's memory is refused.
@@ -396,12 +500,13 @@ impl Memory {
                 && (1..=0xFF).contains(&high)
                 && c >= 0x1_0000
             {
-                self.name(u64::from(c) | u64::from(high) << 32);
+                self.name_constant(u64::from(c) | u64::from(high) << 32);
             }
             if c >= 0x0100_0000 {
-                self.name(u64::from(c) << 8);
+                self.name_constant(u64::from(c) << 8);
             }
         }
+        self.from_constants += self.copies.len() - after_roots;
     }
 }
 
@@ -409,20 +514,22 @@ impl Memory {
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (and, with `writes`, copied back after). None if the host
+/// submitted (and its declared writes copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
-    writes: bool,
+    writes: Writes,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    let before = m.copies.len();
+    let skipped_before = m.speculative_skips;
     m.reconcile()?;
     let frame = crate::frame::current();
     if m.frame != frame {
@@ -432,12 +539,28 @@ pub(crate) fn ready(
         m.take_faults();
     }
     m.prepare_addresses(heap, addresses, constants);
+    // Resolve the precise destinations even when an address has tag bits or
+    // its range crosses into a page the root prefetch did not discover.
+    let before_writes = m.copies.len();
+    writes.pages(|at, _| { m.map(at); });
+    m.from_roots += m.copies.len() - before_writes;
+    let copies = m.copies.len();
+    if copies / 256 != before / 256 || (skipped_before == 0 && m.speculative_skips != 0) {
+        tracing::info!(frame, copies, roots_and_as=m.from_roots, constants=m.from_constants,
+            root_neighbors=m.from_neighbors, shader_faults=m.from_faults, deferred_speculation=m.speculative_skips,
+            ownership_changes=copies - m.from_roots - m.from_constants - m.from_faults - m.from_neighbors,
+            "raw memory copies by first mapping source");
+    }
     m.update_ranges();
-    let base = heap.raw_page_views(&m.copies)?;
+    let (base, count) = heap.raw_page_views(&m.copies)?;
     // A list may submit before the other recording list that numbered a
     // copy. Each must prepare all copies visible at its own bind.
     const READ: usize = usize::MAX - 0x6d;
-    let (reads, written) = list.raw_memory_ranges(&m.directory.0, m.coverage_revision, m.copies.len(), writes);
+    // A bounded writer still reads every mapped copy. It must not advance
+    // the coverage of a later writer with indirect destinations.
+    let (reads, written) = list.raw_memory_ranges(
+        &m.directory.0, m.coverage_revision, count as usize, writes == Writes::All,
+    );
     for i in reads {
         for &(start, len) in &m.ranges[i] {
             m.copies[i].refresh(list, start, len);
@@ -448,6 +571,20 @@ pub(crate) fn ready(
             m.copies[i].gpu_writes(list, start, len, false);
         }
     }
+    writes.owned(&m.pages, |owner, at, len| {
+        if owner < count as usize {
+            m.copies[owner].gpu_writes(list, at, len, false);
+        }
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Writes::Ranges(ranges) = writes {
+        static BOUNDED: AtomicU64 = AtomicU64::new(0);
+        let dispatches = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
+        if dispatches.is_power_of_two() {
+            let bytes = ranges.iter().map(|range| range.1).sum::<u64>();
+            tracing::info!(frame, dispatches, bytes, visible_copies = count, "bounded direct builder raw write declarations");
+        }
+    }
     if list.first_use(READ) {
         list.keep(&m.faults.0);
     }
@@ -455,6 +592,7 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        count,
     })
 }
 
@@ -464,7 +602,140 @@ mod producer_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{page_byte, Memory, CELL, PAGE};
+    use super::{page_byte, Memory, CELL, PAGE, SPECULATIVE_COPIES};
+
+    #[test]
+    fn speculation_stops_before_heap_growth_and_confirmed_accesses_can_still_grow() {
+        use crate::descriptor::{create_srv, host::HostHeap};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none());
+            return;
+        };
+        let pages = SPECULATIVE_COPIES as u64 + 6;
+        let bytes = (pages * PAGE) as usize;
+        let start = (0x300..0x340).map(|i| i * 32 * CELL).find(|&at| unsafe {
+            !VirtualAlloc(at as _, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).is_null()
+        }).unwrap();
+        let mut memory = Memory::new().unwrap();
+        let slot = |m: &Memory, at| unsafe { m.directory.1.add((at / PAGE * 2) as usize).read() };
+        for i in 0..SPECULATIVE_COPIES as u64 - 1 {
+            let at = start + i * PAGE;
+            crate::shadow::register(at as usize, at, PAGE);
+            assert!(memory.map(at));
+        }
+        let last = start + (SPECULATIVE_COPIES as u64 - 1) * PAGE;
+        crate::shadow::register(last as usize, last, 3 * PAGE);
+        // A nested owner of page 1, plus separate definitely needed allocations.
+        for i in [1, 3, 4, 5] {
+            let at = last + i * PAGE;
+            crate::shadow::register(at as usize, at, PAGE);
+        }
+        memory.name_constant(last);
+        assert_eq!(memory.copies.len(), SPECULATIVE_COPIES);
+        assert_eq!(slot(&memory, last + PAGE), 0);
+        let initial = heap.raw_page_views(&memory.copies).unwrap();
+        let fault = last + 3 * PAGE;
+        memory.name_constant(fault);
+        assert_eq!(memory.copies.len(), SPECULATIVE_COPIES);
+        assert_eq!(slot(&memory, fault), 0);
+        assert!(!memory.refused.contains(&(fault / PAGE)));
+        assert!(memory.speculative_skips > 0);
+        // Run an actual GPU lookup in the production directory and write the
+        // missing page to the same feedback bucket that translated shaders use.
+        let host = crate::host::host().unwrap();
+        let shader = r#"
+            ByteAddressBuffer directory : register(t0);
+            RWByteAddressBuffer faults : register(u0);
+            cbuffer Args : register(b0) { uint page; uint bucket; };
+            [RootSignature("SRV(t0), UAV(u0), RootConstants(num32BitConstants=2,b0)")]
+            [numthreads(1,1,1)] void main() {
+                if (!directory.Load(page * 8)) faults.Store(bucket * 4, page);
+            }"#;
+        let code = crate::host::compile(shader, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        let root: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &code) }.unwrap();
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, ID3D12PipelineState,
+        };
+        let pso: ID3D12PipelineState = unsafe {
+            host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            })
+        }.unwrap();
+        let page = (fault / PAGE) as u32;
+        let bucket = 1 + page % (victory_shader::emit::MEMORY_FAULTS - 1);
+        let lookup = |m: &Memory| {
+            let list = host.new_list().unwrap();
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootShaderResourceView(0, m.directory.2);
+                list.list.SetComputeRootUnorderedAccessView(1, m.faults.2);
+                list.list.SetComputeRoot32BitConstants(2, 2, [page, bucket].as_ptr().cast(), 0);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            unsafe { m.faults.1.add(bucket as usize).read_volatile() }
+        };
+        assert_eq!(lookup(&memory), page);
+        memory.take_faults();
+        assert_eq!(slot(&memory, fault) as usize, SPECULATIVE_COPIES + 1);
+        assert_eq!(memory.from_faults, 1);
+        assert_eq!(lookup(&memory), 0);
+        let typed = last + 4 * PAGE;
+        let mut descriptor = [0u32; 8];
+        let handle = descriptor.as_mut_ptr() as u64;
+        let view = [0, 11, 5768, 0, typed as u32, (typed >> 32) as u32, 0, 0, 0, 0];
+        create_srv(std::ptr::null(), std::ptr::null(), &view, handle);
+        heap.mirror(1, handle, false).unwrap();
+        let direct = last + 5 * PAGE;
+        memory.prepare_addresses(&heap, &[last, direct], &[]);
+        assert_ne!(slot(&memory, typed), 0);
+        assert_ne!(slot(&memory, direct), 0);
+        assert_ne!(slot(&memory, last + PAGE), slot(&memory, last));
+        assert_ne!(slot(&memory, last + PAGE), 0);
+        assert_eq!(slot(&memory, last + 2 * PAGE), slot(&memory, last));
+        let grown = heap.raw_page_views(&memory.copies).unwrap();
+        assert_ne!(grown.0, initial.0);
+        assert!(grown.1 as usize > SPECULATIVE_COPIES);
+        drop(memory);
+        drop(heap);
+        for i in 0..pages {
+            let at = start + i * PAGE;
+            crate::shadow::unregister(at as usize, at);
+        }
+        assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn bounded_builder_raw_writes_follow_page_owners_and_gpu_address_width() {
+        use super::{BTreeMap, MEMORY_PAGES, Writes};
+        let limit = u64::from(MEMORY_PAGES - 1) * PAGE;
+        let pages = BTreeMap::from([(0, 6), (1, 4), (2, 9), (limit / PAGE - 1, 8)]);
+        let parts = |ranges: [(u64, u64); 2]| {
+            let mut output = Vec::new();
+            Writes::Ranges(ranges).owned(&pages, |owner, at, len| output.push((owner, at, len)));
+            output
+        };
+        // High tag bits have no effect in the shader. Neighboring pages
+        // can have distinct owners, and a range can end on an unmapped page.
+        assert_eq!(
+            parts([((0xab << 40) | (2 * PAGE - 4), 24), (3 * PAGE - 4, 24)]),
+            [(4, 2 * PAGE - 4, 4), (9, 2 * PAGE, 20), (9, 3 * PAGE - 4, 4)]
+        );
+        // The clamped directory entry is null; wrapping the shader's
+        // 40-bit address can make the trailing dwords accessible again.
+        assert_eq!(
+            parts([(limit - 4, 24), ((1 << 40) - 4, 24)]),
+            [(8, limit - 4, 4), (6, 0, 20)]
+        );
+    }
 
     #[test]
     fn raw_builder_maps_headers_named_by_the_view_heap_without_a_shader_table() {
@@ -515,6 +786,30 @@ mod tests {
         assert_eq!(directory_slot(&memory, start + CELL), 0);
         assert_eq!(memory.copies.len(), 2);
         assert!(heap.raw_page_views(&memory.copies).is_some());
+        // A shifted scalar points to the uncommitted last page before the
+        // middle cell. Its neighbor is valid but the scalar gives no reason
+        // to allocate that neighbor. A GPU fault there is definite.
+        let scalar = ((start + CELL - PAGE) >> 8) as u32;
+        memory.prepare_addresses(&heap, &[], &[scalar]);
+        assert_eq!(directory_slot(&memory, start + CELL), 0);
+        assert_eq!(memory.copies.len(), 2);
+        unsafe { memory.faults.1.add(1).write(((start + CELL) / PAGE) as u32) };
+        memory.take_faults();
+        assert_ne!(directory_slot(&memory, start + CELL), 0);
+        assert_eq!((memory.from_roots, memory.from_constants, memory.from_faults), (2, 0, 1));
+        drop(memory);
+        // Both encodings of a real address still seed their current and
+        // following cells before any shader can fault.
+        let empty_heap = HostHeap::new(false, 4).unwrap();
+        let mut memory = Memory::new().unwrap();
+        memory.prepare_addresses(&empty_heap, &[], &[(start >> 8) as u32]);
+        assert_ne!(directory_slot(&memory, start), 0);
+        assert_ne!(directory_slot(&memory, start + CELL), 0);
+        assert_eq!(directory_slot(&memory, start + 2 * CELL), 0);
+        let middle = start + CELL;
+        memory.prepare_addresses(&empty_heap, &[], &[middle as u32, (middle >> 32) as u32]);
+        assert_ne!(directory_slot(&memory, start + 2 * CELL), 0);
+        assert_eq!(memory.from_constants, 3);
         drop(memory);
         for at in [start, start + CELL, start + 2 * CELL] {
             crate::shadow::unregister(at as usize, at);

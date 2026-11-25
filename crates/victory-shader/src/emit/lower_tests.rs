@@ -163,7 +163,7 @@
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
@@ -178,42 +178,18 @@
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64,
-            vgprs: 256,
-            layout,
-            used,
-            io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, wave64, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
+        lower_compute(words, layout, used, wave64, true)
     }
 
-    /// A compute `lower()` of `words` with `layout` and `used`, wave64 or
-    /// not, with or without 512 bytes of LDS.
     pub(super) fn lower_compute(
         words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, wave64: bool, lds: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        lower_compute_with_views(words, layout, used, wave64, lds, &[])
+    }
+
+    pub(super) fn lower_compute_with_views(
+        words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, wave64: bool, lds: bool,
+        uint_srvs: &'static [(u8, u32, u32)],
     ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
@@ -234,7 +210,7 @@
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
+        super::lower_program(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -244,7 +220,7 @@
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        })
+        }, false, uint_srvs)
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
@@ -381,6 +357,31 @@
     }
 
     #[test]
+    fn only_a_used_structured_srv_count_requests_a_host_word() {
+        let words = [
+            0xBE84_0300, 0xBE85_0380, // s[4:5] = descriptor table at s0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF06_800A,              // s_cmp_eq_u32 s10, 0
+            0xBF85_0001,              // s_cbranch_scc1 to second end
+            S_ENDPGM, S_ENDPGM,
+        ];
+        let compile = |code: &[u32], kind, stride| {
+            lower_with(code, vec![root(RootType::Table, 0, 0)], vec![UsedResource {
+                kind, root: RootType::Table, table_offset_dwords: 0, lower_bound: 0, stride,
+                dwords: 4, user_data: 0, slot: 0,
+            }])
+        };
+        let requested = |s: Lowered| s.user_data.iter()
+            .any(|u| u.root == RootType::Other(super::super::USER_VIEW_RECORDS));
+        assert!(requested(compile(&words, ResourceType::Srv, 16).unwrap()));
+        assert!(compile(&words, ResourceType::Srv, 0).is_err());
+        assert!(compile(&words, ResourceType::Uav, 16).is_err());
+        let mut unused = words;
+        unused[4] = 0xBF06_8008; // compare the view address instead
+        assert!(!requested(compile(&unused, ResourceType::Srv, 16).unwrap()));
+    }
+
+    #[test]
     fn a_descriptor_selected_by_scc_picks_its_heap_index() {
         // Two buffer descriptors loaded from the table at s0, one picked by
         // a root constant (s1) with s_cselect_b64 per half, and loaded
@@ -419,7 +420,7 @@
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+    pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
             kind,
             root: RootType::Table,
@@ -437,6 +438,30 @@
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]
