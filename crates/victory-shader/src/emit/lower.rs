@@ -25,6 +25,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[path = "packed_mask.rs"]
+mod packed_mask;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -198,6 +201,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Numeric joins a packed mask word already keeps live.
+    packed_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -1503,6 +1508,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            packed_phis: HashSet::new(),
             stale: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -3133,6 +3139,33 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar move copies all 32 bits of each word, regardless of EXEC.
+    /// Follow its same-half SSA input to an existing numeric word. A phi
+    /// ends the search and is kept live by the caller's normal numeric read.
+    fn copied_mask_word(&self, mut v: Value) -> Option<Value> {
+        let low = self.x.st.highs.get(&v).copied().unwrap_or(v);
+        if self.mask_data != MaskData::Console || self.s.wave_size != Some(64)
+            || !self.x.st.masks.contains_key(&low) || self.x.st.active.contains(&low)
+        {
+            return None;
+        }
+        loop {
+            let block = &self.x.p.blocks[*self.def_block.get(&v)?];
+            let inst = block.insts.iter().find(|i| i.writes.iter().any(|&(_, out)| out == v))?;
+            if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
+                return None;
+            }
+            let Fields::Sop { dst: Some(Operand::Scalar { code: dst, dwords }), ref src, .. } =
+                inst.fields else { return None };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else { return None };
+            let word = (0..dwords).find(|half| inst.write(Reg::S(dst + half)) == Some(v))?;
+            v = inst.read(Reg::S(src + word))?;
+            if matches!(self.vals.get(&v), Some(Val::I32(_))) {
+                return Some(v);
+            }
+        }
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3147,8 +3180,14 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if let Some(source) = self.copied_mask_word(v) {
+                return self.i32_of(source);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
+            }
+            if let Some(word) = self.packed_mask_word(v) {
+                return Ok(word);
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -11358,6 +11397,29 @@ impl<'a> Lower<'a> {
             for &a in &p.blocks[b].phis[i].args {
                 if self.phi_at.contains_key(&a) && self.read_phis.insert(a) {
                     work.push(a);
+                }
+            }
+        }
+        // A numeric join can receive a scalar copy of another join's mask.
+        // Retain those original words and their incoming numeric joins before
+        // filling any phi: an earlier phi may otherwise have empty inputs
+        // replaced by the unused-value fallback before its later copy asks.
+        if self.mask_data == MaskData::Console && self.s.wave_size == Some(64) {
+            let mut work: Vec<_> = self.read_phis.iter().copied().collect();
+            let mut copied = HashSet::new();
+            while let Some(v) = work.pop() {
+                let Some(&(b, i)) = self.phi_at.get(&v) else { continue };
+                for &arg in &p.blocks[b].phis[i].args {
+                    let source = match self.vals.get(&arg) {
+                        Some(Val::I32(_)) => None,
+                        _ => self.copied_mask_word(arg),
+                    };
+                    let Some(source) = source.or_else(|| copied.contains(&v).then_some(arg))
+                    else { continue };
+                    if self.phi_at.contains_key(&source) && copied.insert(source) {
+                        self.read_phis.insert(source);
+                        work.push(source);
+                    }
                 }
             }
         }

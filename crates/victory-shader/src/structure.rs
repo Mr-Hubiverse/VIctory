@@ -1716,7 +1716,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
         for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
             let p = build(
