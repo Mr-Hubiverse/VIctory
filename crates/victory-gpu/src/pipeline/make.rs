@@ -1288,10 +1288,10 @@ mod tests {
         let first = poll(&p);
         assert!(matches!(first, None | Some(false)));
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
-        let started = Instant::now();
-        while poll(&p).is_none() && started.elapsed() < Duration::from_secs(10) {
-            std::thread::yield_now();
-        }
+        // The shared workers may be queued behind the rest of the suite for
+        // a while: make it here rather than waiting them out (a worker
+        // claiming it first makes this a no-op: `made` is set once).
+        p.make();
         assert_eq!(poll(&p), Some(false));
     }
 
