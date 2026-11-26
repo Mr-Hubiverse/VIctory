@@ -2904,8 +2904,8 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // A page without a copy: its number, at a place by the number, only
+        // when an active lane misses; mapped accesses skip the modulo and store.
         let zero = k(self, 0);
         // A newer command list can publish more pages after this one has
         // recorded. Only reference descriptors prepared for this particular bind.
@@ -2916,24 +2916,27 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
+        let fault_gate = self.begin_guarded(Some(missing));
+        let fc = self.cur;
         let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
+        let place = self.s.m.bin(fc, Bin::URem, page, places);
         let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
+        let place = self.s.m.bin(fc, Bin::Add, place, one);
         let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let place = self.s.m.bin(fc, Bin::Shl, place, k2);
         let faults = self.s.root_uav_handle(SLOT_FAULTS, false);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
-            c,
+            fc,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.end_guarded(fault_gate, &[]);
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
