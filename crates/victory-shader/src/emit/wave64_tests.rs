@@ -779,3 +779,165 @@ fn backward_permute_stays_inside_each_half_of_a_console_wave() {
         eprintln!("wave{wave}, {threads} threads: verified every lane on the GPU");
     }
 }
+
+/// A wave64 group of two console waves (128 threads) with a wave reduction at
+/// top level: on a host of 32-lane waves each console wave is a pair of host
+/// waves that exchange their halves' ORs through shared memory, meeting by
+/// themselves on the pair's flag dwords. Each wave's lane 0 stores the OR.
+#[test]
+fn a_wave_or_in_a_group_of_two_console_waves() {
+    use crate::dxbc::Container;
+    let mut words = vec![
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x2C10_0086, // v_lshrrev_b32 v8, 6, v0 (this thread's console wave)
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8 (its byte offset)
+        0x3612_00BF, // v_and_b32 v9, 63, v0 (its console lane)
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x7DA4_1280, // v_cmpx_eq_u32 exec, 0, v9: each wave's lane 0 stores
+        0xBF88_0002, // s_cbranch_execz past the store
+        0xE070_1000,
+        0x8002_0008, // buffer_store_dword v0, v8, s[8:11], 0 offen
+    ]);
+    let mut shaders = Vec::new();
+    for threads in [128u32, 96] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+        let io = io::raise(&p, &native).expect("io");
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        shaders.push(shader.expect("translate"));
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for (shader, threads) in shaders.iter().zip([128u32, 96]) {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return;
+            }
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        // 96 threads: the second console wave has only its lower half — its
+        // wave's lane 0 stores the lower half's OR alone (bits 0..15).
+        let expected = [u32::MAX, if threads == 128 { u32::MAX } else { 0xFFFF }];
+        assert_eq!(out[0][..2], expected, "{threads} threads");
+        eprintln!("{threads} threads: console waves exchanged their halves' ORs");
+    }
+}
+
+/// A wave64 group of two console waves (128 threads) with a wave reduction
+/// inside a per-lane branch: on a host of 32-lane waves the branch widened is
+/// taken differently by the two console waves, so the host waves of one meet
+/// no host wave of the other. A group barrier in it would wait for threads
+/// that never come: the pair of host waves of a console wave meets by itself.
+#[test]
+fn a_wave_or_inside_a_lane_branch_in_a_group_of_two_console_waves() {
+    use crate::dxbc::Container;
+    let mut words = vec![
+        0xBE87_0380, // s_mov_b32 s7, 0 (no thread in the branch yet)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x2C10_0086, // v_lshrrev_b32 v8, 6, v0 (this thread's console wave)
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8 (its byte offset)
+        0x3612_00BF, // v_and_b32 v9, 63, v0 (its console lane)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 20, // s_cbranch_execz past the OR
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x7DA4_1280, // v_cmpx_eq_u32 exec, 0, v9: each wave's lane 0 stores
+        0xBF88_0002, // s_cbranch_execz past the store
+        0xE070_1000,
+        0x8002_0008, // buffer_store_dword v0, v8, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("io");
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("translate");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    // Each wave's lane l gives bit l >> 1 (the OR is per console wave;
+    // threads below s0 take the branch). Wave 0 answers for threads 0..63,
+    // wave 1 for 64..127: two dwords.
+    for (below, lo, hi) in [
+        (128u32, u32::MAX, u32::MAX),
+        (100, u32::MAX, 0x0003_FFFF),
+        (70, u32::MAX, 0x7),
+        (64, u32::MAX, 0),
+        (40, 0x000F_FFFF, 0),
+        (10, 0x1F, 0),
+        (0, 0, 0),
+    ] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(out[0][..2], [lo, hi], "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: two console waves decided for themselves");
+}

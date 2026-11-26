@@ -61,8 +61,8 @@ impl<'a> Lower<'a> {
         if !halves {
             return Ok(mine);
         }
-        let (lo, hi) = self.exchange_halves(c, mine);
-        let c = self.cur;
+        let (c, (lo, hi)) = self.exchange_halves(c, mine);
+        self.cur = c;
         let total = self.add_halves(lo, hi);
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
