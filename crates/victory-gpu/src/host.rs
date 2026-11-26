@@ -922,7 +922,7 @@ fn create() -> windows::core::Result<Host> {
 impl Host {
     /// Whether this device is on the software adapter (WARP or the basic render driver): asked of the adapter the
     /// device reports, not of a switch. Used by the tests that need a card.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "diagnostics"))]
     pub(crate) fn is_software(&self) -> bool {
         self.adapter
             .as_ref()
