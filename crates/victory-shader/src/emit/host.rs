@@ -64,6 +64,23 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether `device` is on the software adapter: the basic render driver's flag, or its vendor and device.
+fn software(device: &ID3D12Device) -> bool {
+    // SAFETY: a plain factory and adapter query for a live device.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()) else {
+            return false;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return false;
+        };
+        desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
     /// the adapter `VICTORY_ADAPTER` names (a part of its description).
