@@ -104,6 +104,7 @@ impl<'a> Lower<'a> {
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
+        let at = self.s.m.cont(at);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
@@ -115,7 +116,12 @@ impl<'a> Lower<'a> {
             // half and meets no one.
             let paired = self.paired();
             let (hs, join) = (self.s.m.new_block(), self.s.m.new_block());
+            // `at` can be a closed block's tail — a lane mask emitted lazily
+            // long after its block ended: the exchange's branch replaces that
+            // terminator, and the merge continues where `at` was going.
+            let resume = self.s.m.term(at);
             self.s.m.terminate(at, Term::CondBr(paired, hs, join));
+            self.s.m.close(at, join);
             let ptr = self.s.m.element(hs, lds, index);
             self.s.m.store(hs, ptr, mine);
             let e = self.pair_meet(hs, 0);
@@ -128,11 +134,15 @@ impl<'a> Lower<'a> {
             // the slots are written again only after the other half read them
             let e = self.pair_meet(e, 1);
             self.s.m.terminate(e, Term::Br(join));
+            self.s.m.close(e, join);
             let ty = self.s.m.type_of(mine);
             let (lp, hp) = (self.s.m.phi(join, ty), self.s.m.phi(join, ty));
             let z = self.s.m.i32(0);
             self.s.m.set_phi(lp, vec![(lo, e), (mine, at)]);
             self.s.m.set_phi(hp, vec![(hi, e), (z, at)]);
+            if let Some(t) = resume {
+                self.s.m.terminate(join, t);
+            }
             return (join, (lp, hp));
         }
         let ptr = self.s.m.element(at, lds, index);
@@ -249,7 +259,10 @@ impl<'a> Lower<'a> {
     pub(super) fn pair_meet(&mut self, at: usize, kind: u32) -> usize {
         let paired = self.paired();
         let (hs, join) = (self.s.m.new_block(), self.s.m.new_block());
+        let at = self.s.m.cont(at);
+        let resume = self.s.m.term(at);
         self.s.m.terminate(at, Term::CondBr(paired, hs, join));
+        self.s.m.close(at, join);
         let e = self.s.entry;
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
@@ -282,6 +295,9 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(lp, Term::CondBr(ok, join, lp));
         // ...and what the other wrote is seen by what this wave reads after
         self.s.op(join, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        if let Some(t) = resume {
+            self.s.m.terminate(join, t);
+        }
         join
     }
 

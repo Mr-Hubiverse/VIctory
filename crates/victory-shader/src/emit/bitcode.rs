@@ -221,7 +221,12 @@ pub(crate) struct Module {
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
+    /// The block each instruction went into, parallel with `insts`.
+    inst_block: Vec<u32>,
     blocks: Vec<Block>,
+    /// The merge of each split and the instruction count when it happened
+    /// ([`Module::close`]).
+    moved: HashMap<usize, (usize, u32)>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
@@ -408,11 +413,63 @@ impl Module {
         }
     }
 
+    /// `at` was split into paths that merge at `into`. Code can hold `at`
+    /// across the split — a lane-mask exchange run lazily while an operand
+    /// resolves, say — and then emit into it. What those instructions read
+    /// decides where they go ([`Module::push`]): operands defined before the
+    /// split mean they belong before its branch, where they dominate the
+    /// most; an operand defined at `into` or later means the merge, since a
+    /// use of it in `at` would be a forward reference.
+    pub fn close(&mut self, at: usize, into: usize) {
+        self.moved.insert(at, (into, self.insts.len() as u32));
+    }
+
+    /// `at` itself, or the merge of the split that closed it.
+    pub fn cont(&self, mut at: usize) -> usize {
+        while let Some(&(into, _)) = self.moved.get(&at) {
+            at = into;
+        }
+        at
+    }
+
+    /// Whether instruction `v` stands where `at` can read it: in `at` itself,
+    /// or emitted before `at` was split at `made` (every block an operand is
+    /// emitted into dominates `at` in practice — an instruction read through
+    /// a stale `at` reads what it was written with).
+    fn ready(&self, v: V, at: usize, made: u32) -> bool {
+        match v {
+            V::Inst(j) => {
+                self.inst_block[j as usize] == at as u32 || j < made
+            }
+            _ => true,
+        }
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let mut at = block;
+        while let Some(&(into, made)) = self.moved.get(&at) {
+            let need_into = |v: V| !self.ready(v, at, made);
+            let into_it = match &op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) => need_into(*a) | need_into(*b),
+                Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => need_into(*v),
+                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+                    need_into(*a) | need_into(*b) | need_into(*c)
+                }
+                Op::Store(a, b) | Op::AtomicRmw(_, a, b) => need_into(*a) | need_into(*b),
+                Op::Call(_, args) => args.iter().any(|&a| need_into(a)),
+                Op::Gep(_, v, ix) => need_into(*v) | ix.iter().any(|&a| need_into(a)),
+                Op::Phi(args) => args.iter().any(|&(a, _)| need_into(a)),
+            };
+            if !into_it {
+                break;
+            }
+            at = into;
+        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
+        self.inst_block.push(at as u32);
         // Terminators are kept apart, so a block can still grow at its end.
-        self.blocks[block].body.push(i);
+        self.blocks[at].body.push(i);
         V::Inst(i)
     }
 
@@ -455,6 +512,8 @@ impl Module {
             ty,
             op: Op::Phi(Vec::new()),
         });
+        let block = self.cont(block);
+        self.inst_block.push(block as u32);
         self.blocks[block].phis.push(i);
         V::Inst(i)
     }
@@ -568,6 +627,7 @@ impl Module {
                     ty,
                     op: Op::Phi(back),
                 });
+                self.inst_block.push(latch as u32);
                 self.blocks[latch].phis.push(j);
                 if let Some(&tag) = self.tags.get(&i) {
                     self.tags.insert(j, tag);
@@ -584,7 +644,13 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// The terminator `block` already has, if it was closed out.
+    pub fn term(&self, block: usize) -> Option<Term> {
+        self.blocks[block].term
+    }
+
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.cont(block);
         self.blocks[block].term = Some(t);
     }
 

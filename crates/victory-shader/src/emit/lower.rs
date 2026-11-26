@@ -4009,8 +4009,8 @@ impl<'a> Lower<'a> {
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
-        let head = self.cur;
+        let head = self.s.m.cont(self.cur);
+        self.s.m.terminate(head, Term::CondBr(g, then, join));
         self.cur = then;
         Some((head, join))
     }
@@ -4020,8 +4020,11 @@ impl<'a> Lower<'a> {
         let Some((head, join)) = at else {
             return values.iter().map(|v| v.0).collect();
         };
-        let then = self.cur;
+        let then = self.s.m.cont(self.cur);
+        let head = self.s.m.cont(head);
         self.s.m.terminate(then, Term::Br(join));
+        self.s.m.close(then, join);
+        self.s.m.close(head, join);
         self.cur = join;
         values
             .iter()

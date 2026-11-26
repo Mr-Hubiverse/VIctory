@@ -529,6 +529,37 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // A read through a near-null pointer inside the title is often a value
+    // pulled from the title VM's stack (the script engines keep theirs on
+    // r13). Dump the slots around r13 and the caller's opcode bytes, which
+    // say which instruction popped it and what the neighbours held.
+    if code == EXCEPTION_ACCESS_VIOLATION && p[0] == 0 && p[1] < 0x10000 {
+        // r13 points at the VM state; its first field is the stack pointer
+        // (handlers do `mov [r13], sp; sub sp, 8; mov [r13], sp`).
+        if let Some(sp) = read_u64(context.R13 as usize) {
+            line(format!("  VM stack top {sp:#x}"));
+            for i in (0..16).rev() {
+                let at = (sp as usize).wrapping_sub(i * 8 + 8);
+                if let Some(v) = read_u64(at) {
+                    line(format!(
+                        "  [sp-{:#04x}] {v:#x} ({})",
+                        i * 8 + 8,
+                        locate(v as usize)
+                    ));
+                } else {
+                    break;
+                }
+            }
+        }
+        // In the caller's frame the opcode/operand bytes sit just above
+        // its rsp (the faulting call pushed a return address).
+        let frame = context.Rsp as usize + 8;
+        for off in [0x30usize, 0x31, 0x32, 0x33] {
+            if let Some(b) = read_u64(frame + off).map(|v| v as u8) {
+                line(format!("  caller rsp+{off:#x} = {b:#04x}"));
+            }
+        }
+    }
     if to_file {
         let said = crash_context() + &title_output();
         eprint!("{said}");
@@ -613,6 +644,26 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
 /// `module+rva`, or the bare address.
 pub fn locate(address: usize) -> String {
     module_of(address).unwrap_or_else(|| format!("{address:#x}"))
+}
+
+/// A qword read from title memory during a crash report, or `None` where
+/// the page is not readable. Safer than a bare read inside the handler:
+/// a second fault there would end the report early.
+fn read_u64(at: usize) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `at` itself.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    const READABLE: u32 = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
+    let bad = info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+    if n == 0 || info.State != MEM_COMMIT || info.Protect & READABLE == 0 || bad {
+        return None;
+    }
+    // SAFETY: the query says committed and readable.
+    Some(unsafe { (at as *const u64).read_unaligned() })
 }
 
 fn module_of(address: usize) -> Option<String> {

@@ -346,6 +346,7 @@ impl Module {
             op: self.insts[i as usize].op.clone(),
         };
         self.insts.push(inst);
+        self.inst_block.push(b as u32);
         if let Some(&tag) = self.tags.get(&i) {
             self.tags.insert(copy, tag);
         }
