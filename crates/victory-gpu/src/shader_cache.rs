@@ -77,6 +77,7 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(validator_id().as_bytes());
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -105,11 +106,87 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     {
         return victory_shader::emit::translate_ray_probe(container).map_err(|e| e.to_string());
     }
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let shader = victory_shader::emit::translate(c).map_err(|e| e.to_string())?;
+        validate(&shader)?;
+        Ok(shader)
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Refuses a translation the DXIL validator (`dxil.dll`) rejects, before
+/// any driver sees it. AMD's RDNA 4 driver (RX 9060 XT and RX 9070 XT,
+/// 32.0.320xx) faults inside its shader compiler (`amdxc64.dll`, a read of
+/// 0x8) at pipeline creation on some programs the validator rejects, which
+/// ends the process; a refused shader only drops its draws. The validator
+/// works on a copy (it signs in place). `VICTORY_VALIDATE=0` turns the gate
+/// off; without `dxil.dll` it warns once and lets every translation pass.
+/// The gate's setting and the validator's identity are in the cache key
+/// ([`build`]), so a refusal cached by one setting is not served to another.
+#[cfg(windows)]
+fn validate(shader: &HostShader) -> Result<(), String> {
+    use std::cell::RefCell;
+    use victory_shader::emit::validator::Validator;
+    if !validate_enabled() {
+        return Ok(());
+    }
+    thread_local! {
+        static VALIDATOR: RefCell<Option<Validator>> = RefCell::new(
+            match Validator::load(Validator::default_path().as_deref()) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!(error = %e, "no DXIL validator; translations are not checked"));
+                    None
+                }
+            }
+        );
+    }
+    VALIDATOR.with(|v| {
+        let mut v = v.borrow_mut();
+        let Some(v) = v.as_mut() else { return Ok(()) };
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).map_err(|text| {
+            let first = text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("Validation failed"))
+                .or_else(|| text.lines().next())
+                .unwrap_or("")
+                .to_owned();
+            format!("the DXIL validator rejects it: {first}")
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn validate(_: &HostShader) -> Result<(), String> {
+    Ok(())
+}
+
+/// `VICTORY_VALIDATE` (on unless `0`).
+fn validate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VALIDATE").is_none_or(|v| v != "0"))
+}
+
+/// What identifies the validator the gate runs: its path, size and time.
+fn validator_id() -> String {
+    #[cfg(windows)]
+    if validate_enabled() {
+        let path = victory_shader::emit::validator::Validator::default_path();
+        let meta = path.as_ref().and_then(|p| std::fs::metadata(p).ok());
+        return format!(
+            "{:?}|{:?}|{:?}",
+            path,
+            meta.as_ref().map(|m| m.len()),
+            meta.and_then(|m| m.modified().ok())
+        );
+    }
+    "off".to_owned()
 }
 
 /// The cache entry's converter: the build and the container in, the

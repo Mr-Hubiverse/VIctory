@@ -235,6 +235,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// [`Lower::handles`] of buffer size queries, which share no handle
+    /// with an access ([`Lower::swap_size_caches`]).
+    size_handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1574,6 +1577,7 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            size_handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -6181,7 +6185,22 @@ impl<'a> Lower<'a> {
         used: Option<&'a UsedResource>,
     ) -> Result<(), Why> {
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // A buffer's record count is queried through a handle of its own,
+        // never the handle of an access. AMD's RDNA 4 driver (RX 9060 XT
+        // and RX 9070 XT, 32.0.320xx) faults inside its shader compiler,
+        // ending the process at pipeline creation, when one handle of a raw
+        // buffer feeds both a size query whose result is used and a load;
+        // with a handle each it compiles. An image's handle stays shared
+        // with its accesses.
+        let buffer = image.is_none();
+        if buffer {
+            self.swap_size_caches();
+        }
+        let h = self.handle(site, &src, false, props);
+        if buffer {
+            self.swap_size_caches();
+        }
+        let h = h?;
         let words: Vec<(u32, V)> = match image {
             Some(kind) => self.image_size_words(h, kind, uav),
             None => {
@@ -6616,6 +6635,12 @@ impl<'a> Lower<'a> {
         uses.contains(&value).then(|| {
             self.host_word(RootType::Other(super::shader::USER_VIEW_RECORDS), rp.slot, dword)
         })
+    }
+
+    /// Trades the handle cache of accesses for that of buffer size queries,
+    /// and back when called again.
+    fn swap_size_caches(&mut self) {
+        std::mem::swap(&mut self.handles, &mut self.size_handles);
     }
 
     /// A handle for the descriptor `src` read at `site`.
