@@ -71,17 +71,13 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// Pin a registry entry while its removal is excluded by the registry lock.
-/// A final release may already have reduced the count to zero before removal.
+/// Adds a reference to an object that has one; false if it has none any
+/// more (its last one is being released).
 #[cfg(windows)]
-pub(crate) fn try_add_ref(this: This) -> bool {
-    // SAFETY: the caller holds the lock the object's destructor must acquire.
-    unsafe { &*this }
-        .refs
-        .fetch_update(Ordering::Acquire, Ordering::Relaxed, |n| {
-            if n == 0 { None } else { n.checked_add(1) }
-        })
-        .is_ok()
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {

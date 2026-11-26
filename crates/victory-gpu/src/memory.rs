@@ -600,6 +600,36 @@ pub(crate) fn ready(
 #[path = "memory/producer_tests.rs"]
 mod producer_tests;
 
+/// Forgets the run of title-memory views kept for host view heap `heap`
+/// (`Memory::heaps`, by address), when the title releases its heap. A heap
+/// made later at the same address found the old run: its null view and the
+/// copies' views were never written there, and the run's first slot could
+/// lie among the new heap's title slots or past its end, so shaders reading
+/// through raw addresses indexed views that were not theirs. (Fork pull
+/// request #589, AscilCH.)
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    PAGE_RUN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+}
+
+/// The host view heaps (by address) that hold a run of title-memory views
+/// ([`HostHeap::raw_page_views`]): the run lives on the heap, this set only
+/// tells a later heap made at the same address from it.
+static PAGE_RUN_HEAPS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Host view heap `heap` holds a run of title-memory views now.
+pub(crate) fn note_page_run(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    PAGE_RUN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+}
+
+/// Whether a run of title-memory views is kept for the host view heap at
+/// address `key` (tests).
+#[cfg(test)]
+pub(crate) fn has_run(key: usize) -> bool {
+    PAGE_RUN_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).contains(&key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{page_byte, Memory, CELL, PAGE, SPECULATIVE_COPIES};

@@ -216,6 +216,7 @@ mod tests {
             written_root_uavs: lowered.written_root_uavs,
             writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: Vec::new(),
+            half_views: lowered.half_views,
         };
         assert_eq!(shader.root_srvs, [crate::emit::SLOT_VIEW_ADDRESSES]);
         let _one = crate::emit::valu_tests::ONE_AT_A_TIME

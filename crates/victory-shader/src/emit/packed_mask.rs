@@ -211,6 +211,7 @@ mod tests {
             written_root_uavs: lowered.written_root_uavs,
             writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: Vec::new(),
+            half_views: lowered.half_views,
         };
         if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
             validator.validate(&mut shader.dxil).unwrap();

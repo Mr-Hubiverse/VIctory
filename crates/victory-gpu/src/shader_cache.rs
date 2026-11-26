@@ -78,8 +78,39 @@ fn build() -> [u8; 32] {
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     h.update(validator_id().as_bytes());
+    // The list this file reads for the translator (`translate_listed`): the
+    // shader crate's fingerprint does not see it.
+    h.update(b"VICTORY_WAVE_WIDE_ONLY=");
+    if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
+        h.update(value.as_encoded_bytes());
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// A container translated with the wave-wide form allowed when its hash is
+/// on `VICTORY_WAVE_WIDE_ONLY` (16-hex-digit hashes as the log names
+/// shaders, comma separated; unset or empty: none). Off by default: two
+/// programs that moved to that form were in a submission that lost the card
+/// (runs 121-124, not proven the cause). After commit a416e392 of pull
+/// request #823 (Felix2180), whose list is the four refused programs
+/// 5dc3b25986622949 and 6f225b641c5b0708 (the water's transmission
+/// volumetrics), 369cbe906ea72764 (particle visibility) and
+/// 2cc4c197ee29e291 (the reflection pass's tiling). For runs and the offline
+/// warm-up alike, which share the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect()
+    });
+    let hash = blake3::hash(c).to_hex();
+    let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
+    victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
@@ -91,7 +122,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_listed(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -107,7 +138,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         return victory_shader::emit::translate_ray_probe(container).map_err(|e| e.to_string());
     }
     let translate = |c: &[u8]| {
-        let shader = victory_shader::emit::translate(c).map_err(|e| e.to_string())?;
+        let shader = translate_listed(c)?;
         validate(&shader)?;
         Ok(shader)
     };
@@ -335,6 +366,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -409,6 +445,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -421,6 +462,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         written_root_uavs,
         writes_guest_memory,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -457,6 +499,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

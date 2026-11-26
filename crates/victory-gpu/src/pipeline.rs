@@ -148,11 +148,13 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
-    pub(crate) compute_threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute shader's group size (`numthreads`); `[0; 3]` for other
+    /// stages. A `DispatchX` that counts threads is made groups with it.
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -211,21 +213,18 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let compute_threads = programs.iter().find_map(|p| match &p.io {
-        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
-        _ => None,
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
     });
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, compute_threads, used, stores })
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, stores, threads })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -433,6 +432,9 @@ pub(crate) fn builder_runs() -> bool {
         if failed > 0 {
             b.off = true;
             b.frame_decision = Some((frame, false));
+            for p in b.pipelines.iter().filter(|p| make::poll(p) == Some(false)) {
+                tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+            }
             tracing::warn!(
                 missing = failed,
                 of = b.pipelines.len(),
@@ -573,6 +575,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -716,6 +736,9 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        // Named once each (gfx41): which programs are the builder's, to
+        // match against the refused and untranslated ones.
+        tracing::info!(n = b.pipelines.len(), ?shaders, "a pipeline of the ray-tracing structure builder");
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -866,6 +889,17 @@ pub(crate) extern "system" fn create_stream(
             graphics.read(kind, desc.stream.add(at))
         };
         at += size;
+    }
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::integer_targets_do_not_blend`).
+    #[cfg(windows)]
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
     }
     hand_out(
         shaders,

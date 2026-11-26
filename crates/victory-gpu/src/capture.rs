@@ -1338,7 +1338,7 @@ mod tests {
         state.draw_indexed(&list, 3, 1, 0, 0, 0);
         state.dispatch_mesh(&list, 1);
         assert_eq!(crate::draw::attempted() - before, 3, "a draw, an indexed draw and a mesh dispatch, all dropped");
-        state.dispatch(&list, 1, 1, 1, None);
+        state.dispatch(&list, 1, 1, 1);
         assert_eq!(crate::draw::attempted() - before, 3, "a compute dispatch, dropped, is not one");
         list.close();
     }
