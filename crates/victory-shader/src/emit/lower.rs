@@ -6213,9 +6213,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `s_load_dword*` from the program's constant table.
-
-
     /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
     /// descriptor but whose dwords the code reads: the first dword, the handle properties,
     /// the image kind (none for a buffer), whether it is an unordered view, and its
