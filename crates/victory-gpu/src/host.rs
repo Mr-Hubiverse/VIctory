@@ -891,13 +891,13 @@ mod tests {
             let started = std::time::Instant::now();
             for _ in 0..CALLS {
                 let deferred = locked.lock().unwrap_or_else(|e| e.into_inner());
-                std::hint::black_box(deferred.fill_start);
+                std::hint::black_box(deferred.copies.len());
             }
             let old = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
             let started = std::time::Instant::now();
             for _ in 0..CALLS {
                 let deferred = list.deferred();
-                std::hint::black_box(deferred.fill_start);
+                std::hint::black_box(deferred.copies.len());
             }
             let new = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
             println!("sample {sample}: lock {old:.1} ns, direct {new:.1} ns");
