@@ -76,6 +76,7 @@ pub(crate) struct Usage {
     pub int64: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
+    pub rovs: bool,
     /// A handle from the view heap.
     pub heap_views: bool,
     /// A handle from the sampler heap.
@@ -1117,7 +1118,9 @@ impl Module {
                 };
                 let name = self.funcs[*f as usize].name.as_str();
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if name.starts_with("wave") || name.starts_with("quad") {
+                if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
+                } else if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {

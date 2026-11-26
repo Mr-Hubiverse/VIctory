@@ -1124,12 +1124,6 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// signature packs a short element into the free columns of an earlier
 /// register) is NOT in that row's halves: it follows in the first
 /// parameter, in row order, that has whole dwords left.
-/// The title's packed pedestrian shaders show both cases: TEXCOORD7 (register 1,
-/// columns 2-3, behind the two columns of TEXCOORD0) is exported in dword 3
-/// of parameter 0, after TEXCOORD1's two dwords; TEXCOORD6 (register 4,
-/// column 3, behind the three columns of TEXCOORD4) in dword 3 of
-/// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
-/// TEXCOORD4's second dword stays zero.
 type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
 
 fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
@@ -2378,11 +2372,10 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
-                    // Above the SGPRs the hardware initializes, a register
-                    // holds what the last wave left, so no program depends
-                    // on it: a read the paths only seem to allow (a branch
-                    // past the write, taken only with one past the read)
-                    // reads zero, as VGPRs do.
+                    None if super::pops::collision_register(self.x.native) == Some(n) => {
+                        Val::I32(self.s.m.i32(super::pops::NO_COLLISION))
+                    }
+                    // Treat SGPRs above the hardware inputs like unset VGPRs.
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
                         Val::I32(self.s.m.i32(0))
                     }
@@ -3320,6 +3313,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            super::pops::EXITING_WAVE_ID if super::pops::active(self.x.native) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -5249,7 +5243,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if self.x.native.stage == HwStage::Ps && super::pops::disables_ordering(inst) {
+        if self.x.native.stage == HwStage::Ps && super::pops::skip_setreg(self.x.native, inst) {
             return Ok(());
         }
         let scc = inst.write(Reg::Scc);
@@ -6667,6 +6661,11 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        let ordered = super::pops::active(self.x.native) && props.0 & 0x1000 != 0;
+        let props = (props.0 | (u32::from(ordered) << 13), props.1);
+        if ordered {
+            self.s.flags |= flags::ROVS;
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -6728,7 +6727,9 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
-                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b)
+                        if !super::pops::active(self.x.native) =>
+                    {
                         // Other groups write what a builder reads.
                         let shared = self.ordered();
                         Ok(self.s.root_uav_handle(rp.slot, shared))

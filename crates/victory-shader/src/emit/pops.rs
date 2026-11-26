@@ -3,10 +3,35 @@
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand, Valu};
 use crate::ir::{Exit, Inst, Program};
+use crate::native::{NativeProgram, StageIo};
 
-const EXITING_WAVE_ID: Operand = Operand::Const(239);
+pub(super) const EXITING_WAVE_ID: Operand = Operand::Const(239);
+pub(super) const NO_COLLISION: u32 = 1 << 16;
 const POPS_PACKER: u16 = 25;
 const ORDERED_PS_DONE: u16 = 7;
+
+pub(super) fn active(native: &NativeProgram) -> bool {
+    matches!(native.io, StageIo::Ps { db_shader_control, .. } if db_shader_control & (1 << 16) != 0)
+}
+
+/// The collision input follows the user data and the primitive mask.
+/// The host orders UAV accesses with ROVs. Seed distinct synthetic wave IDs
+/// with overlap clear so native polling does not wait on an AMD wave.
+pub(super) fn collision_register(native: &NativeProgram) -> Option<u8> {
+    if !active(native) {
+        return None;
+    }
+    let user = native
+        .layout
+        .iter()
+        .map(|r| u32::from(r.user_data) + r.sgprs)
+        .max();
+    Some(user.unwrap_or(0).clamp(8, 104) as u8 + 1)
+}
+
+pub(super) fn skip_setreg(native: &NativeProgram, inst: &Inst) -> bool {
+    disables_ordering(inst) || (active(native) && packer_write(inst).is_some())
+}
 
 fn packer_write(inst: &Inst) -> Option<(u16, &[Operand])> {
     match (inst.name(), &inst.fields) {

@@ -424,7 +424,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    if native.stage == HwStage::Ps {
+    if native.stage == HwStage::Ps && !pops::active(native) {
         pops::check(p)?;
     }
     // (what an earlier program's lowering on this thread left behind)
@@ -2075,6 +2075,53 @@ mod barycentric_tests {
         let words = [&[0xba80_1019, 0][..], &tail].concat();
         let cleared = pixel(&words, 0).unwrap();
         assert_eq!(cleared.dxil, baseline.dxil);
+    }
+
+    #[test]
+    fn active_pops_texture_store_declares_rasterizer_ordering() {
+        use crate::native::{RootParam, RootType};
+
+        let words: [u32; 10] = [
+            0xb982_0019, // s_setreg_b32 hwreg(POPS_PACKER, 0, 1), s2
+            0xbe81_0380, // s_mov_b32 s1, 0 (table address high half)
+            0xf40c_0200,
+            0xfa00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            0x7e00_0280,
+            0x7e02_0280, // v0 and v1 = 0 (coordinate)
+            0xf020_0f08,
+            0x0002_0000, // image_store v[0:3], v[0:1], s[8:15], 2D
+            0xbf90_0007, // s_sendmsg ORDERED_PS_DONE
+            0xbf81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 1 << 16,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let program = ir::build(&native.code, false, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources = resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        let shader = emit(&container, &native, &program, &structured, &io, &resources).unwrap();
+        assert_ne!(parts(&shader).0 & 0x1000, 0);
     }
 
     pub(super) fn pixel_with_inputs(

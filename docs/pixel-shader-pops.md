@@ -32,3 +32,9 @@ With this PR applied to the [PR #47 preload launcher](https://github.com/DexNom/
 The follow-up checks control flow from the POPS packer write to an explicit completion instruction. A filtered rerun found a path to an ordinary exit before explicit completion in every shader in the table. Six diagnostics point to `0x305c` and four to `0x32b4`. This identifies an ordering case a ROV lowering would have to handle. DXIL emission for the ten remains 0/10.
 
 The emitter now accepts an immediate zero that clears the inactive packer enable bit in a pixel shader without ordered operations. A synthetic test compares the emitted DXIL with an otherwise identical shader. The active protocol and the exit that bypasses completion have separate regression coverage.
+
+## D3D12 translation of the ten shaders
+
+The emitter reads the POPS enable flag from pixel-stage metadata and marks heap UAV handles as rasterizer ordered. It uses the guest layout to identify the collision SGPR and seeds distinct synthetic wave IDs so the shader does not wait for a GFX10 wave. D3D12 ROV accesses supply the ordering. The DXIL feature flags reflect the ROV handles that survive optimization. A pixel format without active POPS still uses the previous diagnostic, and direct root UAVs in active POPS shaders remain unsupported. [Upstream ROV work](https://github.com/Marvisak/VIctory/pull/2490) · [Collision seed](https://github.com/Marvisak/VIctory/pull/2395) · [Feature flags](https://github.com/Marvisak/VIctory/pull/2610)
+
+On the RTX 5060, each hash in the table was tested individually. All ten emitted DXIL, declared the ROV feature, passed the Windows SDK validator, and created a D3D12 graphics pipeline with a generated vertex shader. A separate `warm` run with an empty cache translated all ten with zero refusals. All 14 pixel tests passed, including a synthetic ordered texture store. In-game output and overlapping-fragment rendering remain unverified.
