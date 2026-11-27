@@ -187,7 +187,11 @@ pub(super) fn build_compute_shader(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })?;
+    
+        psv: None,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,})?;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -201,7 +205,8 @@ pub(super) fn build_compute_shader(
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: lowered.half_views,
-    };
+    
+        stride_table: lowered.stride_table,};
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -1065,7 +1070,11 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    });
+    
+        psv: None,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,});
     match r {
         Err(ShaderError::Unsupported { what, .. }) => {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");

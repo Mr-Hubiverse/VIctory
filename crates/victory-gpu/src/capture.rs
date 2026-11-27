@@ -20,6 +20,13 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// too, and their draws traced at debug level. `VICTORY_CAPTURE_HEAVY_FRAMES`
 /// lists frames counted from the heavy scene's first ([`heavy_frame`]).
 pub(crate) fn listed(n: u64) -> bool {
+    n == ASKED.load(std::sync::atomic::Ordering::Relaxed) || in_list(n)
+}
+
+/// The frame whose targets `wantall` in the folder asked for.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn in_list(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
@@ -569,7 +576,15 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some_and(|f| {
+        // `wantall` in the folder: the targets of a frame soon, once;
+        // `want`: the next frame.
+        if std::fs::remove_file(f.join("wantall")).is_ok() {
+            crate::resource::census_log();
+            ASKED.store(n + 2, std::sync::atomic::Ordering::Relaxed);
+        }
+        n.is_power_of_two() || listed(n) || before_world || in_world || std::fs::remove_file(f.join("want")).is_ok()
+    })
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -774,13 +789,176 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// What the frame whose targets are dumped runs, as recorded: list, text.
+static PASSES: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Copies of the first render target taken within the frame (`VICTORY_SNAP`:
+/// names of programs, before the first draw of which), with the target the
+/// tiled lighting drew to.
+#[allow(clippy::type_complexity)]
+static SNAPS: std::sync::Mutex<(
+    usize,
+    Vec<(
+        String,
+        ID3D12Resource,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+)> = std::sync::Mutex::new((0, Vec::new()));
+
+fn snap(list: &crate::host::HostList, text: &str, target: usize) {
+    let Ok(wanted) = std::env::var("VICTORY_SNAP") else {
+        return;
+    };
+    let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if snaps.0 == 0 && text.contains("TL_PS_") {
+        snaps.0 = target;
+    }
+    let Some(name) = wanted
+        .split(',')
+        .find(|w| text.contains(*w) && !snaps.1.iter().any(|s| s.0 == **w))
+    else {
+        return;
+    };
+    let resource = snaps.0 as crate::object::This;
+    let (Some(host), Some(texture)) = (
+        crate::host::host(),
+        (!resource.is_null())
+            .then(|| crate::resource::host_resource(resource))
+            .flatten(),
+    ) else {
+        return;
+    };
+    crate::list::ensure_state(list, resource, 0x800);
+    if let Some((buffer, footprint)) = read_back(&host.device, &list.list, texture) {
+        snaps.1.push((name.to_owned(), buffer, footprint));
+    }
+    if target == resource as usize {
+        crate::list::ensure_state(list, resource, 0x4);
+    }
+}
+
+fn save_snaps() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(folder) = folder() else { return };
+    for (i, (name, buffer, footprint)) in snaps.1.iter().enumerate() {
+        let f = footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy ran; the mapping spans the footprint's rows.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let rows = std::slice::from_raw_parts(
+                data.cast::<u8>(),
+                f.RowPitch as usize * f.Height as usize,
+            );
+            let file = format!(
+                "raw-{:03}-{}x{}-f{}-p{}.raw",
+                900 + i,
+                f.Width,
+                f.Height,
+                f.Format.0,
+                f.RowPitch
+            );
+            let _ = std::fs::write(folder.join(file), rows);
+            buffer.Unmap(0, None);
+        }
+        tracing::info!(i, name, "snapshot saved");
+    }
+}
+
+/// Notes a draw or dispatch of `list`.
+pub(crate) fn pass(list: &crate::host::HostList, target: usize, text: impl FnOnce() -> String) {
+    if dump_on()
+        && std::env::var_os("VICTORY_DUMP_RAW").is_some()
+        && listed(crate::queue::presented() + 1)
+    {
+        let text = text();
+        snap(list, &text, target);
+        PASSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((std::ptr::from_ref(list) as usize, text));
+    }
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+/// `VICTORY_PRESENT_TARGET=<width>x<height>:<format>[:<n>]`: present the
+/// `n`-th (first-use order, default 0) texture of that size and DXGI format
+/// the frame renders to or writes, in place of what the title presents, to
+/// see a pass the final image does not show (e.g. the G-buffer while lighting
+/// is still black). Frames without such a texture present as usual.
+fn present_spec() -> Option<(u64, u32, i32, usize)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let v = std::env::var("VICTORY_PRESENT_TARGET").ok()?;
+        let mut parts = v.split(':');
+        let (w, h) = parts.next()?.split_once('x')?;
+        let format = parts.next()?.trim().parse().ok()?;
+        let n = parts.next().map_or(Some(0), |n| n.trim().parse().ok())?;
+        let spec = (w.trim().parse().ok()?, h.trim().parse().ok()?, format, n);
+        tracing::info!(
+            ?spec,
+            "presenting a render target in place of the title's image"
+        );
+        Some(spec)
+    })
+}
+
+/// The frame being built and the textures it used that match
+/// [`present_spec`], in first-use order.
+#[allow(clippy::type_complexity)]
+static PRESENTED: std::sync::Mutex<(
+    u64,
+    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>,
+)> = std::sync::Mutex::new((0, Vec::new()));
+
+fn note_present(resource: crate::object::This) {
+    let Some((w, h, format, _)) = present_spec() else {
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if (d.Width, d.Height, d.Format.0) != (w, h, format)
+        || d.SampleDesc.Count > 1
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 != frame {
+        *p = (frame, Vec::new());
+    }
+    if !p.1.iter().any(|&(r, _)| r == resource as usize) {
+        p.1.push((resource as usize, copy));
+    }
+}
+
+/// At the present of `frame`: the texture to show in place of the title's,
+/// if [`present_spec`] names one the frame used.
+pub(crate) fn present_override(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let (.., n) = present_spec()?;
+    let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 != frame {
+        return None;
+    }
+    let (_, list) = std::mem::take(&mut *p);
+    list.into_iter().nth(n).map(|(_, t)| t)
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    if !resource.is_null() {
+        note_present(resource);
+    }
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
@@ -796,7 +974,77 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(host) = crate::host::host() else { return };
+    save_snaps();
+    let passes = std::mem::take(&mut *PASSES.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(folder) = folder()
+        && !passes.is_empty()
+    {
+        let text: Vec<String> = passes.iter().map(|(l, t)| format!("{l:x} {t}")).collect();
+        // What indirect draws' arguments are now that everything ran.
+        let mut args = String::new();
+        for (i, (_, t)) in passes.iter().enumerate() {
+            if let Some(at) = t
+                .strip_prefix("indirect")
+                .and_then(|t| t.split_once(" at 0x"))
+                .and_then(|(_, t)| t.split_once(' '))
+                .and_then(|(t, _)| u64::from_str_radix(t, 16).ok())
+            {
+                args.push_str(&format!("{i} {at:#x} {}
+", crate::shadow::args_text(at)));
+            }
+        }
+        // `VICTORY_PEEK=<program>:<table+slot>:<hex offset>,...`: what a placed
+        // buffer a program reads holds.
+        for peek in std::env::var("VICTORY_PEEK").unwrap_or_default().split(',') {
+            let mut parts = peek.split(':');
+            let (Some(program), Some(slot), Some(offset)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let offset = u64::from_str_radix(offset, 16).unwrap_or(0);
+            // A placed view's address, a constant buffer's or a buffer view's.
+            let found = passes
+                .iter()
+                .find(|(_, t)| t.contains(program))
+                .and_then(|(_, t)| t.split_once(&format!("{slot}: ")))
+                .and_then(|(_, t)| {
+                    if t.starts_with("placed") {
+                        let (_, t) = t.split_once(" at 0x")?;
+                        u64::from_str_radix(t.split_once('"')?.0, 16).ok()
+                    } else if let Some(t) = t.strip_prefix("Constant(0x") {
+                        u64::from_str_radix(t.split_once(',')?.0, 16).ok()
+                    } else if let Some(t) = t.strip_prefix("buffer Some((") {
+                        t.split_once(',')?.0.parse().ok()
+                    } else {
+                        None
+                    }
+                });
+            // A fourth part, a hex length: that many bytes there, as a file.
+            if let (Some(at), Some(len)) =
+                (found, parts.next().and_then(|l| usize::from_str_radix(l, 16).ok()))
+            {
+                let mut bytes = vec![0u8; len.min(1 << 26)];
+                if crate::host::read_into((at + offset) as *const u8, &mut bytes) {
+                    let _ = std::fs::write(folder.join(format!("peek-{:x}.bin", at + offset)), bytes);
+                }
+            }
+            if let Some(at) = found {
+                args.push_str(&format!(
+                    "peek {peek} {at:#x}: {}
+",
+                    crate::shadow::args_text(at + offset)
+                ));
+            }
+        }
+        args.push_str(&crate::resource::targets_text());
+        let _ = std::fs::write(folder.join("args.txt"), args);
+        let _ = std::fs::write(folder.join("passes.txt"), text.join("
+"));
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -806,7 +1054,15 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one(
+            host,
+            texture,
+            state,
+            frame,
+            i,
+            *resource as crate::object::This,
+            &d,
+        );
     }
 }
 
@@ -880,7 +1136,23 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        if std::env::var_os("VICTORY_DUMP_RAW").is_some()
+            && (d.Width >= 1200 || d.Width <= 160)
+            && let Some(folder) = folder()
+        {
+            let name = format!(
+                "raw-{i:03}-{}x{}-f{}-p{pitch}.raw",
+                f.Width, f.Height, f.Format.0
+            );
+            let _ = std::fs::write(std::path::Path::new(folder).join(name), rows);
+        }
+        if let Some(rgba) = to_rgba(
+            f.Format.0 as u32,
+            f.Width as usize,
+            f.Height as usize,
+            pitch,
+            rows,
+        ) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -955,7 +1227,11 @@ fn stencil_values(
 }
 
 fn half(h: u16) -> f32 {
-    let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let (sign, exp, man) = (
+        (h >> 15) as u32,
+        ((h >> 10) & 0x1f) as i32,
+        (h & 0x3ff) as f32,
+    );
     let v = match exp {
         0 => man * 2f32.powi(-24),
         31 => f32::INFINITY,
@@ -983,7 +1259,8 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    let u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -1043,6 +1320,24 @@ pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]
     } else {
         (0.0, finite.fold(0.0f32, f32::max))
     };
+    let wild = values.iter().filter(|v| v.iter().any(|c| !c.is_finite())).count();
+    let mut most = high;
+    if !grey && matches!(format, 1..=2 | 9..=11 | 26) {
+        // What most pixels reach: a few far brighter ones leave the rest black.
+        let mut lit: Vec<f32> = values
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .step_by(7)
+            .collect();
+        if !lit.is_empty() {
+            let k = lit.len() * 95 / 100;
+            most = *lit.select_nth_unstable_by(k, f32::total_cmp).1;
+        }
+    }
+    tracing::info!(format, low, high, most, wild, w, h, "target values");
+    let high = most;
     let range = (high - low).max(1e-20);
     // How much of the target holds anything: a lit scene and one bright
     // lamp on black have the same highest value.

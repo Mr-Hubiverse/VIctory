@@ -38,6 +38,7 @@ pub(crate) enum Kind {
     Check,
     /// Every other host list: the title's own, our present copies.
     Lists,
+    #[allow(dead_code)]
     /// Inside one of those: from where a pipeline is bound to where the
     /// next one is, or the list ends ([`begin_named`]).
     Pipeline,
@@ -210,6 +211,7 @@ pub(crate) fn end(list: &ID3D12GraphicsCommandList, span: Span) {
     }
 }
 
+#[allow(dead_code)]
 /// Whether the card's time is also measured pipeline by pipeline inside the
 /// title's lists (`VICTORY_CARD_METER_PIPELINES=1`; off by default: two
 /// more queries and a resolve at every change of pipeline).
@@ -218,6 +220,7 @@ pub(crate) fn pipelines() -> bool {
     *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"))
 }
 
+#[allow(dead_code)]
 /// The pipeline `name` is bound on `list` here: the first timestamp of a
 /// pair that [`end`] closes where the next pipeline is bound or the list
 /// ends. What the card does between the two (the draws or dispatches of

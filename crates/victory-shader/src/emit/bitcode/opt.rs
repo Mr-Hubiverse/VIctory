@@ -1,3 +1,7 @@
+//! From the VIctory fork at commit ba8697aa (its `emit/bitcode/opt.rs`,
+//! GPL-3.0-or-later), adapted to this tree's module: local arrays and
+//! doubles, and no first-lane pass.
+//!
 //! Clean-up of a finished module before it is written: the lowering emits
 //! one instruction after another as the console code names them, and
 //! nothing stands between it and the driver's compiler. Every pass here is
@@ -186,6 +190,8 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *p = f(*p);
             idx.iter_mut().for_each(|i| *i = f(*i));
         }
+        // The size is a constant.
+        Op::Alloca(..) => {}
     }
 }
 
@@ -229,6 +235,12 @@ pub(super) fn effect(f: &Func) -> Effect {
         // building a ray-tracing resolve program of the title, which RDNA 3's
         // builds (see also `own_heap_handles`).
         Some(Attr::ReadOnly) if name.starts_with("getDimensions") => Effect::Reads,
+        // A shader cannot write a constant buffer or resize a resource.
+        Some(Attr::ReadOnly)
+            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
+        {
+            Effect::Pure
+        }
         Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
         // Declared with the attribute of calls that have effects, and have
@@ -505,6 +517,10 @@ impl Module {
         }
     }
 
+    fn is_undef(&self, v: V) -> bool {
+        matches!(v, V::Const(c) if matches!(self.consts[c as usize].1, Const::Undef))
+    }
+
     fn int_bits(&self, ty: Ty) -> Option<u32> {
         match self.types[ty.0 as usize] {
             TypeDef::Int(bits) => Some(bits),
@@ -591,6 +607,9 @@ impl Module {
                     return None;
                 };
                 let (x, y) = (f32::from_bits(*x), f32::from_bits(*y));
+                if !matches!(self.types[self.type_of(a).0 as usize], TypeDef::Float) {
+                    return None;
+                }
                 let unordered = x.is_nan() || y.is_nan();
                 // Bits 0-2 of a predicate: equal, greater, less; bit 3:
                 // or unordered.
@@ -697,7 +716,10 @@ impl Module {
                             Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
                                 Some(self.f32(bits as u32))
                             }
-                            Const::Float(bits) if self.int_bits(ty) == Some(32) => {
+                            Const::Float(bits)
+                                if self.int_bits(ty) == Some(32)
+                                    && matches!(self.types[from.0 as usize], TypeDef::Float) =>
+                            {
                                 Some(self.int_const(ty, i64::from(bits as i32)))
                             }
                             _ => None,
@@ -754,6 +776,8 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
+            // Each is memory of its own: never one for another (no key).
+            Op::Alloca(..) => Effect::Lanes,
             Op::Call(f, _) => effects[*f as usize],
         }
     }
@@ -817,7 +841,13 @@ impl Module {
                                 Some(_) => same = false,
                             }
                         }
-                        if let (true, Some(v)) = (same, one) {
+                        // Not by an undefined value: this tree's lowering
+                        // joins a register nothing writes with itself, and
+                        // what read the join would read the undefined value
+                        // itself, which the validator refuses.
+                        if let (true, Some(v)) = (same, one)
+                            && !self.is_undef(v)
+                        {
                             repl[p as usize] = Some(v);
                             again = true;
                             changed = true;
@@ -919,11 +949,13 @@ impl Module {
                 }
                 if passes & FOLD != 0
                     && let Some(v) = self.simplify(i, &mut changed)
+                    && !self.is_undef(v)
                 {
                     repl[i as usize] = Some(v);
                     changed = true;
                     continue;
                 }
+                let _class = self.class(effects, i);
                 let class = self.class(effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
@@ -1069,6 +1101,23 @@ impl Module {
             for_each_operand(&self.insts[i as usize].op, |v| {
                 mark(&mut live, &mut work, v)
             });
+        }
+        // Diagnostics (`VICTORY_SHADER_OPT_TRACE=1`): the calls that leave,
+        // by function, on the error output.
+        if std::env::var_os("VICTORY_SHADER_OPT_TRACE").is_some() {
+            let mut gone: std::collections::BTreeMap<String, u32> = Default::default();
+            for (b, blk) in self.blocks.iter().enumerate() {
+                for &i in blk.body.iter().filter(|&&i| !reached[b] || !live[i as usize]) {
+                    let what = match &self.insts[i as usize].op {
+                        Op::Call(f, _) => self.funcs[*f as usize].name.clone(),
+                        Op::Load(_) => "load".into(),
+                        Op::Alloca(..) => "alloca".into(),
+                        _ => continue,
+                    };
+                    *gone.entry(what).or_default() += 1;
+                }
+            }
+            eprintln!("clean-up: calls dropped as dead: {gone:?}");
         }
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {

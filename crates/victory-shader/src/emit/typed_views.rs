@@ -1,7 +1,7 @@
 //! Host SRV component types and declared ranges for tracked guest descriptors.
 use super::super::bitcode::Ty;
 use super::Lower;
-use crate::native::{RootType, UsedResource};
+use crate::native::RootType;
 use crate::resource::Source;
 
 impl<'a> Lower<'a> {
@@ -26,45 +26,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The used-resource entry a descriptor loaded from a table falls in.
-    pub(super) fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
-            src
-        {
-            return self.used_kind(args.first()?);
-        }
-        if let Source::LanePhi { args, .. } = src {
-            return args.iter().flatten().find_map(|a| self.used_kind(a));
-        }
-        if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
-                .x
-                .native
-                .used
-                .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
-        }
-        let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
-        };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
-        }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
-    }
 }
 
 #[cfg(test)]

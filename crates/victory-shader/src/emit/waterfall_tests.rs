@@ -69,7 +69,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
+    
+        psv: None,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,})
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, 1);
@@ -87,7 +91,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
         half_views: lowered.half_views,
-    };
+    
+        stride_table: lowered.stride_table,};
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");

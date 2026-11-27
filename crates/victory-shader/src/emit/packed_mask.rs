@@ -212,7 +212,8 @@ mod tests {
             writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: Vec::new(),
             half_views: lowered.half_views,
-        };
+        
+            stride_table: lowered.stride_table,};
         if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
             validator.validate(&mut shader.dxil).unwrap();
         }

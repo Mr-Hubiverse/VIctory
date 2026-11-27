@@ -44,8 +44,8 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
-    /// In code order, then copies made to give every loop one entry; block 0
-    /// is the entry.
+    /// In code order, then copies made to give every loop one entry. Block 0
+    /// is the entry, which can be an empty block before the code.
     pub blocks: Vec<Block>,
     /// Registers read before any write, with their value on entry: what the
     /// hardware or a called fetch routine set up (user SGPRs, system values,
@@ -56,7 +56,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a
-    /// block and its copies).
+    /// block and its copies). Zero for an empty entry block.
     pub offset: usize,
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
@@ -150,9 +150,17 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     leaders.sort_unstable();
     leaders.dedup();
     let parked = unspill(&mut list, &leaders, &flows, wave64, lanes, vgprs);
+    // When the first instruction is a loop header, give SSA a separate
+    // entry edge to carry the initial register values into its phis.
+    let preheader = usize::from(
+        flows
+            .iter()
+            .any(|flow| matches!(flow, Flow::Jump(0) | Flow::Branch(0))),
+    );
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
+            .map(|b| b + preheader)
             .map_err(|_| isa(offset, "jump into a block"))
     };
 
@@ -166,11 +174,23 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             exit: Exit::End,
         })
         .collect();
+    if preheader != 0 {
+        blocks.insert(
+            0,
+            Block {
+                offset: 0,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit: Exit::Jump(1),
+            },
+        );
+    }
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
     for (n, ((machine, flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+        let b = leaders.partition_point(|&l| l <= machine.offset) - 1 + preheader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
@@ -214,13 +234,10 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             });
         }
     }
-    link(&mut blocks);
-    if !blocks[0].preds.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a branch to the program entry",
-        });
+    if !wave64 {
+        unspill_parked(&mut blocks);
     }
+    link(&mut blocks);
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
@@ -750,7 +767,18 @@ fn site_pairs(
 /// Rename register reads and writes after changing edges in a reducible graph.
 fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
     let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
+    let (mut live_in, mut live_out) = liveness(&blocks, &order);
+    // A spilled SGPR that some path reads before any write is zero there.
+    let unset: Vec<Inst> = members(&live_in[0])
+        .filter_map(|reg| match reg {
+            Reg::S(c) if SPILLS.contains(&c) => Some(zero(c, blocks[0].offset)),
+            _ => None,
+        })
+        .collect();
+    if !unset.is_empty() {
+        blocks[0].insts.splice(0..0, unset);
+        (live_in, live_out) = liveness(&blocks, &order);
+    }
     let mut values = 0u32;
     let mut new_value = || {
         values += 1;
@@ -1142,6 +1170,130 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     (0..REGS)
         .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
         .map(reg_at)
+}
+
+/// Scalar codes of spilled SGPRs.
+const SPILLS: std::ops::Range<u8> = 128..254;
+
+/// SOP1 opcode.
+const S_MOV_B32: u16 = 3;
+
+/// The VGPR and lane of a `v_writelane_b32` (`true`) or `v_readlane_b32`
+/// (`false`) of a constant lane.
+fn spill(inst: &Inst) -> Option<(u8, u32, bool)> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    let write = match inst.name() {
+        "v_writelane_b32" => true,
+        "v_readlane_b32" => false,
+        _ => return None,
+    };
+    let vector = if write { v.dst.as_ref() } else { v.src.first() };
+    let (Some(&Operand::Vector { reg, .. }), Some(&Operand::Const(c @ 128..=159))) =
+        (vector, v.src.get(1))
+    else {
+        return None;
+    };
+    Some((reg, u32::from(c) - 128, write))
+}
+
+/// Compilers out of SGPRs keep some in lanes of VGPRs they use for nothing
+/// else. Each such lane becomes a scalar register of its own and its reads
+/// and writes become `s_mov_b32`, so that what it holds (a lane mask, say)
+/// is followed like any scalar. 32-lane waves only: 64-lane masks are pairs,
+/// moved together.
+fn unspill_parked(blocks: &mut [Block]) {
+    let mut used = [false; 256];
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        // Of a lane access, the spilled register itself is no other use.
+        let own = spill(inst).map(|s| Reg::V(s.0));
+        // An M0-relative read (`v_movrels_b32`) names every VGPR from its base
+        // up; the compiler indexes a small array with it, never the lanes it
+        // parks scalars in, so it does not make those VGPRs ordinary ones.
+        // (Relative writes still do.)
+        let relative_read = inst.name() == "v_movrels_b32";
+        let n_reads = inst.reads.len();
+        for (k, &(reg, _)) in inst.reads.iter().chain(&inst.writes).enumerate() {
+            if relative_read && k < n_reads && matches!(reg, Reg::V(_)) {
+                continue;
+            }
+            if let Reg::V(v) = reg
+                && Some(reg) != own
+            {
+                used[usize::from(v)] = true;
+            }
+        }
+    }
+    let mut lanes: Vec<(u8, u32)> = Vec::new();
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        if let Some((reg, lane, _)) = spill(inst)
+            && !used[usize::from(reg)]
+            && !lanes.contains(&(reg, lane))
+        {
+            lanes.push((reg, lane));
+        }
+    }
+    // All lanes of a register or none.
+    while lanes.len() > SPILLS.len() {
+        let Some(&(reg, _)) = lanes.last() else { break };
+        lanes.retain(|l| l.0 != reg);
+    }
+    for inst in blocks.iter_mut().flat_map(|b| &mut b.insts) {
+        let Some((reg, lane, write)) = spill(inst) else {
+            continue;
+        };
+        let Some(at) = lanes.iter().position(|&l| l == (reg, lane)) else {
+            continue;
+        };
+        let Fields::Valu(v) = &inst.fields else {
+            continue;
+        };
+        let slot = SPILLS.start + at as u8;
+        let operand = Operand::Scalar { code: slot, dwords: 1 };
+        let (dst, src) = if write {
+            (Some(operand), v.src[0])
+        } else {
+            (v.dst, operand)
+        };
+        let slot = (Reg::S(slot), NONE);
+        if write {
+            inst.reads.clear();
+            // Only fails out of bounds, which `effects` checked.
+            let mut regs = Vec::new();
+            let _ = add_regs(&src, 1, &mut regs);
+            inst.reads.extend(regs.into_iter().map(|r| (r, NONE)));
+            inst.writes = vec![slot];
+        } else {
+            inst.reads = vec![slot];
+        }
+        inst.machine.encoding = gfx10::Encoding::Sop1;
+        inst.machine.opcode = S_MOV_B32;
+        inst.fields = Fields::Sop {
+            dst,
+            src: vec![src],
+            imm: None,
+        };
+    }
+}
+
+/// `s_mov_b32 code, 0` at `offset`.
+fn zero(code: u8, offset: usize) -> Inst {
+    Inst {
+        machine: Instruction {
+            offset,
+            encoding: gfx10::Encoding::Sop1,
+            opcode: S_MOV_B32,
+            words: Vec::new(),
+        },
+        fields: Fields::Sop {
+            dst: Some(Operand::Scalar { code, dwords: 1 }),
+            src: vec![Operand::Const(128)],
+            imm: None,
+        },
+        reads: Vec::new(),
+        writes: vec![(Reg::S(code), NONE)],
+    }
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1686,6 +1838,10 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                // A 16-bit read keeps the other half of its VGPR.
+                if name.starts_with("ds_read") && name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
             if *gds
@@ -1940,6 +2096,42 @@ mod tests {
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
     }
 
+    /// Lanes of a VGPR used for nothing else are scalars of their own; a
+    /// VGPR used otherwise too keeps its lane accesses.
+    #[test]
+    fn spilled_lanes_become_scalars() {
+        let mut code = vec![
+            0xD761_0005,
+            0x0001_0609, // v_writelane_b32 v5, s9, 3
+            0xD761_0005,
+            0x0001_080A, // v_writelane_b32 v5, s10, 4
+            0xD760_0002,
+            0x0001_0705, // v_readlane_b32 s2, v5, 3
+            S_ENDPGM,
+        ];
+        let p = build_words(&code, false);
+        let i = &p.blocks[0].insts;
+        assert!(i[..3].iter().all(|i| i.name() == "s_mov_b32"));
+        assert_eq!(i[0].reads, [(Reg::S(9), input(&p, Reg::S(9)))]);
+        assert_eq!(i[2].reads[0].1, i[0].writes[0].1);
+        assert_ne!(i[0].writes[0].0, i[1].writes[0].0);
+        // 64-lane waves unspill them too: the two lanes are not a pair
+        // (the lower lane's save and restore have no partners).
+        let p = build_words(&code, true);
+        assert!(p.blocks[0].insts[..3]
+            .iter()
+            .all(|i| i.name() == "s_mov_b32"));
+        code.insert(6, 0x7E00_0305); // v_mov_b32 v0, v5
+        let p = build_words(&code, false);
+        assert_eq!(p.blocks[0].insts[0].name(), "v_writelane_b32");
+        // Read before any write: the parked scalar is an input (the lane's
+        // value is undefined).
+        let p = build_words(&[0xD760_0002, 0x0001_0705, S_ENDPGM], false);
+        let i = &p.blocks[0].insts;
+        assert_eq!(i[0].name(), "s_mov_b32");
+        assert!(p.inputs.iter().all(|i| !matches!(i.0, Reg::V(_))));
+    }
+
     #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
@@ -2046,6 +2238,46 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    #[test]
+    fn loops_can_branch_to_offset_zero() {
+        let p = build_words(
+            &[
+                0x8000_8100, // 0: s_add_u32 s0, s0, 1
+                0xBF07_8400, // s_cmp_lg_u32 s0, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -> 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [entry, header, end] = &p.blocks[..] else {
+            panic!("{:?}", p.blocks);
+        };
+        assert!(entry.preds.is_empty());
+        assert!(entry.insts.is_empty());
+        assert_eq!(entry.exit, Exit::Jump(1));
+        assert_eq!(header.offset, 0);
+        assert_eq!(header.preds, [0, 1]);
+        assert_eq!(
+            header.exit,
+            Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            }
+        );
+        assert_eq!(end.exit, Exit::End);
+        let [phi] = &header.phis[..] else {
+            panic!("{:?}", header.phis);
+        };
+        let add = &header.insts[0];
+        assert_eq!(phi.reg, Reg::S(0));
+        assert_eq!(
+            phi.args,
+            [input(&p, Reg::S(0)), add.write(Reg::S(0)).unwrap()]
+        );
+        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
+        assert!(crate::structure::structure(&p).is_ok());
     }
 
     #[test]

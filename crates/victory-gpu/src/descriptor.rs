@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -81,26 +81,50 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
-        if let Some(h) = self.host.get() {
-            return h.as_ref();
-        }
+        self.host_arc_ref().map(std::sync::Arc::as_ref)
+    }
+
+    #[allow(dead_code)]
+    /// Shared reference to the host heap for submission-time bindless sync.
+    #[cfg(windows)]
+    pub(crate) fn host_arc(&self) -> Option<std::sync::Arc<host::HostHeap>> {
+        self.host_arc_ref().cloned()
+    }
+
+    #[cfg(windows)]
+    fn host_arc_ref(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
             return None;
         }
+        // `mirror` queues only while the host heap is unset, under the lock
+        // that makes it, so nothing waits in `pending` once it is set.
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
-        // initialized. Publish only after replaying the queued writes.
-        self.host
+        // initialized: queued writes are replayed before it is published,
+        // and any queued since are replayed here.
+        let h = self
+            .host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_ref()?;
+        if !pending.is_empty()
+            && let Some(step) = increment(self.desc.kind).map(u64::from)
+        {
+            for i in pending.drain(..) {
+                h.mirror(i, self.start + u64::from(i) * step, false);
+            }
+        }
+        Some(h)
     }
 
     /// The handle of descriptor `index` of this heap.
@@ -152,10 +176,21 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
+/// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&handle))
+    else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(index) = heap.index(handle) else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -572,6 +607,9 @@ pub(crate) struct RtvRecord {
 }
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
+// SAFETY: `resource` names a title object kept alive by the list it is
+// recorded for; the record is read-only where it goes.
+unsafe impl Send for RtvRecord {}
 
 impl RtvRecord {
     /// All the view it records is made from: records with equal keys have
@@ -1106,6 +1144,8 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    #[cfg(windows)]
+    host::bindless_viewed_changed();
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -1189,6 +1229,24 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+#[allow(dead_code)]
+/// Of `entries` (slot, (view entry, generation)), those whose view went
+/// stale: one look at the views for all.
+#[cfg(windows)]
+fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    entries
+        .iter()
+        .filter(|(_, (i, generation))| {
+            views
+                .list
+                .get(*i as usize)
+                .is_none_or(|(_, current)| current != generation)
+        })
+        .copied()
+        .collect()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1275,7 +1333,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (words::<14>(resource), words::<16>(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1286,7 +1344,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (words::<14>(resource), words::<16>(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1307,7 +1365,9 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let step = u64::from(increment(kind).unwrap_or(0));
+    let Some(step) = increment(kind).map(u64::from) else {
+        return;
+    };
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
@@ -1414,6 +1474,9 @@ pub(crate) extern "system" fn create_heap(
     let placed = placement.address != 0 && placement.size == size;
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
+        if placement.address.checked_add(size).is_none() {
+            return E_INVALIDARG;
+        }
         (placement.address, None)
     } else {
         match Memory::zeroed(size, 64) {
@@ -1818,7 +1881,7 @@ mod tests {
         put(2, addr, 1);
         clear(2);
         // A copied/renderable texture starting earlier can overlap the view.
-        let _writer = crate::resource::texture_at(base, &writer).unwrap();
+        let _writer = crate::resource::texture_at(base, &writer, 0).unwrap();
         assert!(host.demand_material_texture(heap, 1, new_stamp, frame).is_none(), "GPU-writable owner");
         assert_eq!(release(object), 0);
     }

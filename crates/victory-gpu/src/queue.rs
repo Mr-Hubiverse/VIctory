@@ -1,8 +1,9 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once, unless a wait holds the queue back
+//! (`timeline`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -62,6 +63,9 @@ enum Held {
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
     Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// Work due after what the queue holds before it: a page-mapping
+    /// batch, or a present that found the queue holding.
+    Work(Box<dyn FnOnce() + Send>),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -324,10 +328,7 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        note_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -413,10 +414,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        note_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -436,6 +434,86 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     }
     held.push(what());
     true
+}
+
+/// Marks the queue as holding work and starts the held-queue watcher:
+/// values the CPU writes to memory (a fence's value, say) wake nothing.
+#[cfg(windows)]
+fn note_waiting(this: This) {
+    {
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+    }
+    watch_held();
+}
+
+/// How long a queue may stand at a wait nothing meets before it is made
+/// to run all the same.
+#[cfg(windows)]
+const HELD_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The thread that looks at what holds queues back: values the CPU writes
+/// to memory move no fence and meet no wait until something looks again.
+#[cfg(windows)]
+fn watch_held() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let started = std::thread::Builder::new()
+        .name("victory-held".into())
+        .spawn(|| {
+            let mut stalled: Option<std::time::Instant> = None;
+            loop {
+                if lock(&WAITING).is_empty() {
+                    stalled = None;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(500));
+                if release_held_now(false) {
+                    stalled = None;
+                } else if stalled.is_none() {
+                    stalled = Some(std::time::Instant::now());
+                } else if stalled.is_some_and(|s| s.elapsed() > HELD_LIMIT) {
+                    force_held();
+                    stalled = None;
+                }
+            }
+        });
+    if let Err(error) = started {
+        tracing::warn!(%error, "no thread for held queues");
+    }
+}
+
+/// A wait nothing met for [`HELD_LIMIT`]: the queue runs all the same, as
+/// a present would make it.
+#[cfg(windows)]
+fn force_held() {
+    let queues = lock(&WAITING).clone();
+    for q in queues {
+        // SAFETY: a live queue: one released is taken off the list.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let mut held = lock(line);
+        if let Some(&Held::Wait(fence, value)) = held.first() {
+            static FORCED: AtomicU64 = AtomicU64::new(0);
+            let forced = FORCED.fetch_add(1, Ordering::Relaxed) + 1;
+            if forced <= 32 || forced.is_power_of_two() {
+                tracing::warn!(
+                    queue = format_args!("{q:#x}"),
+                    fence = format_args!("{fence:#x}"),
+                    value,
+                    "a queue's fence wait was never met: its line runs all the same"
+                );
+            }
+            held.remove(0);
+            drop(held);
+            release_held_now(true);
+            return;
+        }
+    }
 }
 
 /// Runs what waiting queues hold as far as their fences have been reached
@@ -732,11 +810,11 @@ pub(crate) fn before_sync() {
 }
 
 #[cfg(windows)]
-fn release_held_now(all: bool) {
+fn release_held_now(all: bool) -> bool {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
-        return;
+        return false;
     }
     let _one = lock(&RELEASING);
     let was_here = RELEASING_HERE.replace(true);
@@ -751,6 +829,7 @@ fn release_held_now(all: bool) {
     // are forced, and none is left when this returns.
     let joining = !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
     let mut joined = Joined::default();
+    let mut ran = false;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -764,8 +843,11 @@ fn release_held_now(all: bool) {
                 let base = usize::from(joined.marked.contains(&q));
                 match held.get(base) {
                     None | Some(Held::Running) => break,
+                    // A fence wait is never passed: `all` runs what the
+                    // queue holds behind it, not the wait itself (that is
+                    // what [`force_held`] is for, a stall away).
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
@@ -783,7 +865,9 @@ fn release_held_now(all: bool) {
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     // The frame is shown behind the parts taken: they are
                     // sent first.
-                    Some(Held::Present(..)) if !joined.is_empty() => break,
+                    Some(Held::Present(..)) | Some(Held::Work(_)) if !joined.is_empty() => {
+                        break;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(base) {
@@ -898,6 +982,21 @@ fn release_held_now(all: bool) {
                         }
                         PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
                     }
+                    Held::Work(work) => {
+                        if all {
+                            work();
+                        } else {
+                            // The line is open while the work runs, as it
+                            // is while a submission is prepared.
+                            held.insert(0, Held::Running);
+                            drop(held);
+                            work();
+                            held = lock(line);
+                            if matches!(held.first(), Some(Held::Running)) {
+                                held.remove(0);
+                            }
+                        }
+                    }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
@@ -915,6 +1014,7 @@ fn release_held_now(all: bool) {
                 lock(&WAITING).retain(|&w| w != q);
             }
         }
+        ran |= moved;
         if !moved {
             if joined.is_empty() {
                 break;
@@ -924,6 +1024,7 @@ fn release_held_now(all: bool) {
             send_joined(&mut joined);
         }
     }
+    ran
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -1054,10 +1155,7 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                note_waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -1122,6 +1220,7 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// Signals once the queue's work before it has run.
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
@@ -1186,12 +1285,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            note_waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1199,7 +1293,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     let _ = (this, value);
     S_OK
 }
-/// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
+
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
@@ -1208,7 +1302,15 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+pub(crate) const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
+/// process first asked.
+pub(crate) fn gpu_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -1223,6 +1325,10 @@ pub(crate) enum Written {
     /// (`crate::query::resolve`, `VICTORY_OCCLUSION`): read when written,
     /// which is once the list has run.
     Query(u32),
+    #[allow(dead_code)]
+    /// A host GPU timestamp read back at this address, put on the GPU clock
+    /// by the submission that resolved it (the GPU clock now elsewhere).
+    HostTimestamp(usize),
 }
 
 impl Written {
@@ -1230,20 +1336,26 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            Written::GpuTimestamp | Written::HostTimestamp(_) => gpu_clock(),
             Written::SystemTimestamp => system_timestamp(),
             Written::Query(slot) => crate::query::result(slot),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
+        // Use atomic Release stores when aligned so concurrent readers (such
+        // as a fence's `AtomicU64` value) observe them without a data race.
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if (at as usize).is_multiple_of(align_of::<AtomicU32>()) {
+                    (*at.cast::<AtomicU32>()).store(value as u32, Ordering::Release);
+                } else {
+                    at.cast::<u32>().write_unaligned(value as u32);
+                    std::sync::atomic::fence(Ordering::Release);
+                }
+            } else if (at as usize).is_multiple_of(align_of::<AtomicU64>()) {
+                (*at.cast::<AtomicU64>()).store(value, Ordering::Release);
             } else {
                 at.cast::<u64>().write_unaligned(value);
+                std::sync::atomic::fence(Ordering::Release);
             }
         }
     }
@@ -1282,15 +1394,46 @@ pub(crate) fn since_last_present() -> Option<std::time::Duration> {
     None
 }
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// A frame passes (tests that check per-frame work).
+#[cfg(test)]
+pub(crate) fn pass_frame() {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The second of several planes: they follow each other with the same frame
+/// token. (Where a plane ends is not known; its start is.)
+#[cfg(windows)]
+fn second_plane(first: *const Plane) -> Option<This> {
+    // SAFETY: the title passes plane descriptions.
+    let token = unsafe { (*first).token };
+    (24..=256).step_by(8).find_map(|offset| {
+        let mut words = [0u64; 3];
+        // SAFETY: plain words.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), 24) };
+        if !crate::host::read_into(first.cast::<u8>().wrapping_add(offset), bytes)
+            || words[0] != token
+            || !(1..=4).contains(&(words[1] as u32))
+            || words[2] < 0x10000
+            || words[2] % 8 != 0
+        {
+            return None;
+        }
+        let mut resource = [0u8; 8];
+        crate::host::read_into(words[2] as *const u8, &mut resource)
+            .then(|| u64::from_le_bytes(resource) as This)
+            .filter(|r| !r.is_null() && crate::resource::is_texture(*r))
+    })
+}
+
+/// Shows the planes' first resources in our window, the second over the
+/// first.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: two planes at most, each over the whole screen, the sources
+/// expected in the common state.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1322,7 +1465,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
-    let _ = this;
+    let _ = (this, planes, plane_parameters);
+    // The frame shown and, of several planes, a second overlaid on it.
+    #[cfg(windows)]
+    let (shown, over) = plane_refs(planes, plane_parameters);
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -1340,6 +1486,16 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
         release_held_now(false);
+    }
+    // A present on a queue that still holds work takes its place in the
+    // line: what the queue held runs first.
+    #[cfg(windows)]
+    if !sent_behind && !this.is_null() {
+        let mut line = lock(&queue(this).held);
+        if !line.is_empty() {
+            line.push(Held::Work(Box::new(move || show_held(shown, over))));
+            return S_OK;
+        }
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
@@ -1395,9 +1551,28 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(target) = crate::capture::present_override(frame)
+        && let Some(host) = crate::host::host()
+    {
+        let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
+        match plane(over.as_ref()) {
+            Some((texture, before)) => {
+                host.present_over(Some((&target.texture, state)), (texture, before), frame);
+            }
+            None => {
+                host.present(&target.texture, state, frame);
+            }
+        }
+        return S_OK;
+    }
     #[cfg(windows)]
     if !sent_behind
-        && planes > 0
+        && let Some(over) = plane(over.as_ref())
+        && let Some(host) = crate::host::host()
+    {
+        host.present_over(plane(shown.as_ref()), over, frame);
+    } else if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
@@ -1419,10 +1594,63 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(windows)]
     LAST_PRESENT_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
-    #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
     S_OK
 }
+/// The first plane's resource (the frame shown) and, of several planes,
+/// the second's (overlaid on it), as [`object::Ref`]s.
+#[cfg(windows)]
+fn plane_refs(planes: u32, plane_parameters: *const Plane) -> (Option<object::Ref>, Option<object::Ref>) {
+    let mut shown = None;
+    let mut over = None;
+    if planes > 1 && !plane_parameters.is_null() {
+        over = second_plane(plane_parameters).map(object::Ref::new);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(planes, found = over.is_some(), "several planes presented"));
+    }
+    if planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+    {
+        // SAFETY: the plane lists `count` resources.
+        let resource = unsafe { *plane.resources };
+        shown = (!resource.is_null()).then(|| object::Ref::new(resource));
+    }
+    (shown, over)
+}
+
+/// A presented resource's host texture and the host state it is in.
+#[cfg(windows)]
+fn plane(
+    resource: Option<&object::Ref>,
+) -> Option<(&'static windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    let resource = resource?.get();
+    let texture = crate::resource::host_resource(resource)?;
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    Some((texture, state))
+}
+
+/// A present that found its queue holding work, run when its turn comes
+/// (the queue's line runs it through [`release_held_now`]).
+#[cfg(windows)]
+fn show_held(shown: Option<object::Ref>, over: Option<object::Ref>) {
+    let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(over) = plane(over.as_ref())
+        && let Some(host) = crate::host::host()
+    {
+        host.present_over(plane(shown.as_ref()), over, frame);
+    } else if let Some((texture, state)) = plane(shown.as_ref())
+        && let Some(host) = crate::host::host()
+    {
+        let _ = host.present(texture, state, frame);
+    }
+    LAST_PRESENT_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -1461,6 +1689,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -1478,14 +1707,27 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// One page-mapping operation captured from a batch at submission time.
+#[derive(Clone, Copy)]
+enum PageOp {
+    /// Map `len` consecutive pool bytes from `source` at `at`.
+    Copy { at: u64, source: u64, len: u64 },
+    /// Map the single pool page at `source` repeatedly `count` times from `at`.
+    Fill { at: u64, source: u64, count: u64 },
+    /// Unmap `len` bytes at `at`.
+    Unmap { at: u64, len: u64 },
+    /// Out-of-bounds pool index, overflow, or unknown range kind.
+    Invalid,
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done after every earlier
+/// submission: at once if none is held back.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1498,15 +1740,17 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    // Read now: the batch and range arrays belong to the title (often on its
+    // stack) and may be reused before a held-back queue runs them.
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    let mut ok = true;
+    let mut ops = Vec::new();
     // The remapping meter: what the title asks for, by kind of range.
     crate::framelog::add(crate::framelog::T::PageMapCalls, 1);
     for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
+        if b.ranges.is_null() || b.count == 0 {
             continue;
         }
         // SAFETY: each batch holds `count` ranges.
@@ -1514,8 +1758,10 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
+            let Some(next) = at.checked_add(len) else {
+                ops.push(PageOp::Invalid);
+                break;
+            };
             {
                 use crate::framelog::{T, add};
                 let counted = match r.kind {
@@ -1529,21 +1775,61 @@ extern "system" fn copy_page_mappings(
                     add(pages, u64::from(r.count));
                 }
             }
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
+            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = || pool.checked_add(u64::from(r.start) * PAGE);
+            match r.kind {
+                0 if inside(r.count) => match source() {
+                    Some(source) => ops.push(PageOp::Copy { at, source, len }),
+                    None => ops.push(PageOp::Invalid),
+                },
+                1 if inside(1) => match source() {
+                    Some(source) => ops.push(PageOp::Fill {
+                        at,
+                        source,
+                        count: u64::from(r.count),
+                    }),
+                    None => ops.push(PageOp::Invalid),
+                },
+                2 => ops.push(PageOp::Unmap { at, len }),
+                3 => {}
+                _ => ops.push(PageOp::Invalid),
+            }
+            at = next;
         }
+    }
+    // Behind what the queue holds, as it is on the console; at once if it
+    // holds nothing.
+    #[cfg(windows)]
+    let held = hold(this, || {
+        let ops = ops.clone();
+        Held::Work(Box::new(move || apply_page_mappings(map, pool, &ops)))
+    });
+    #[cfg(not(windows))]
+    let held = false;
+    if !held {
+        apply_page_mappings(map, pool, &ops);
+    }
+    S_OK
+}
+
+fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageOp]) {
+    let mut ok = true;
+    for &op in ops {
+        ok &= match op {
+            PageOp::Copy { at, source, len } => map(at, source, len),
+            PageOp::Fill { at, source, count } => {
+                (0..count).all(|k| map(at + k * PAGE, source, PAGE))
+            }
+            PageOp::Unmap { at, len } => map(at, 0, len),
+            PageOp::Invalid => false,
+        };
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1598,6 +1884,30 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn test_queue() -> (This, usize) {
+    let desc = QueueDesc {
+        kind: 0,
+        priority: 0,
+        flags: 0,
+        nodes: 0,
+    };
+    let mut q = std::ptr::null();
+    assert_eq!(
+        create(std::ptr::null(), &desc, &QUEUE_IIDS[0], &mut q),
+        S_OK
+    );
+    // SAFETY: one of our queues; its first field is the table.
+    let table = unsafe { *q.cast::<*const *const ()>() };
+    let signal_slot = if table == NEWER_FUNCTIONS.0.as_ptr() {
+        0x80
+    } else {
+        0x70
+    };
+    (q, signal_slot)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1661,6 +1971,292 @@ mod tests {
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+    /// Two queues: the first waits for a value the second signals later.
+    /// The first queue's signal after its wait must not complete before.
+    #[test]
+    fn work_after_a_wait_runs_once_the_other_queue_signals() {
+        type Call = extern "system" fn(This, This, u64) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+
+        let signal = |q: This| slot::<Call>(q, signal_slot(q));
+        let wait = |q: This| slot::<Call>(q, signal_slot(q) + 8);
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+        assert_eq!(completed(done), 0, "ran before the value was reached");
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        // Not held any more: work runs when submitted again.
+        assert_eq!(signal(waits)(waits, done, 2), S_OK);
+        assert_eq!(completed(done), 2);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A present submitted after a wait must not run until the wait is
+    /// reached, must read its stack plane parameters at submission time and
+    /// must keep its resource alive until it runs.
+    #[test]
+    fn present_runs_after_a_queues_wait() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+        let resource = crate::resource::test_buffer(256);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let present = |q: This| slot::<Present>(q, signal_slot(q) + 0x80);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let add_ref = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x08)(o);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let before = FRAMES.load(Ordering::Relaxed);
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        {
+            // Caller's plane parameters may live on its stack and be gone
+            // before the queue wakes.
+            let resources = Box::new([resource]);
+            let plane = Box::new(Plane {
+                token: 1,
+                count: 1,
+                resources: resources.as_ptr(),
+            });
+            assert_eq!(present(waits)(waits, 1, &*plane, std::ptr::null()), S_OK);
+        }
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+
+        assert_eq!(
+            FRAMES.load(Ordering::Relaxed),
+            before,
+            "presented before the wait was reached"
+        );
+        assert_eq!(completed(done), 0);
+        // The queued present holds a reference of its own.
+        assert_eq!(add_ref(resource), 3);
+        assert_eq!(release(resource), 2);
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(FRAMES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(completed(done), 1);
+        assert_eq!(release(resource), 0, "present gave back its reference");
+
+        // Not held any more: present runs at once.
+        assert_eq!(
+            present(waits)(waits, 0, std::ptr::null(), std::ptr::null()),
+            S_OK
+        );
+        assert_eq!(FRAMES.load(Ordering::Relaxed), before + 2);
+
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Page mappings submitted after a wait must not run until the wait is
+    /// reached, and must capture caller-owned batch/range arrays at call time.
+    #[test]
+    fn page_mappings_run_after_a_queues_wait() {
+        use std::sync::Mutex;
+
+        static CALLS: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+        fn record(to: u64, from: u64, len: u64) -> bool {
+            CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((to, from, len));
+            true
+        }
+        crate::resource::use_page_mapper(record);
+
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        type CopyPages = extern "system" fn(This, u32, *const PageBatch, u64, u32, u32) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut waits, mut signals) = (null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut signals), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let copy_pages = |q: This| slot::<CopyPages>(q, signal_slot(q) + 0x78);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let pool = 0x1000_0000_u64;
+        let dst = 0x2000_0000_u64;
+        CALLS.lock().unwrap().clear();
+        assert_eq!(wait(waits)(waits, ready, 1), S_OK);
+        {
+            // Heap-allocated so they are freed before the queue wakes.
+            let ranges = Box::new([
+                PageRange {
+                    kind: 0,
+                    start: 1,
+                    count: 2,
+                },
+                PageRange {
+                    kind: 1,
+                    start: 3,
+                    count: 2,
+                },
+                PageRange {
+                    kind: 2,
+                    start: 0,
+                    count: 1,
+                },
+                PageRange {
+                    kind: 3,
+                    start: 0,
+                    count: 1,
+                },
+            ]);
+            let batch = Box::new(PageBatch {
+                destination: dst,
+                count: ranges.len() as u32,
+                ranges: ranges.as_ptr(),
+            });
+            assert_eq!(copy_pages(waits)(waits, 1, &*batch, pool, 4, 0), S_OK);
+        }
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+
+        assert!(
+            CALLS.lock().unwrap().is_empty(),
+            "page mappings ran before the wait was reached"
+        );
+        assert_eq!(completed(done), 0);
+
+        assert_eq!(signal(signals)(signals, ready, 1), S_OK);
+        assert_eq!(completed(done), 1);
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            vec![
+                (dst, pool + PAGE, 2 * PAGE),
+                (dst + 2 * PAGE, pool + 3 * PAGE, PAGE),
+                (dst + 3 * PAGE, pool + 3 * PAGE, PAGE),
+                (dst + 4 * PAGE, 0, PAGE),
+            ]
+        );
+
+        // Not held any more: runs at once.
+        CALLS.lock().unwrap().clear();
+        let range = PageRange {
+            kind: 2,
+            start: 0,
+            count: 1,
+        };
+        let batch = PageBatch {
+            destination: dst,
+            count: 1,
+            ranges: &range,
+        };
+        assert_eq!(copy_pages(waits)(waits, 1, &batch, pool, 4, 0), S_OK);
+        assert_eq!(*CALLS.lock().unwrap(), vec![(dst, 0, PAGE)]);
+
+        for object in [waits, signals, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A queue held back behind a fence whose memory is written directly
+    /// (bypassing `Signal` and bottom-of-pipe writes) wakes without needing
+    /// another submission on that queue.
+    #[test]
+    fn direct_memory_write_wakes_held_queue() {
+        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut waits = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut waits), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut ready, mut done) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
+
+        let signal = |q: This| slot::<Sync>(q, signal_slot(q));
+        let wait = |q: This| slot::<Sync>(q, signal_slot(q) + 8);
+        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
+        let address = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as usize;
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        assert_eq!(wait(waits)(waits, ready, 4), S_OK);
+        assert_eq!(signal(waits)(waits, done, 1), S_OK);
+        assert_eq!(completed(done), 0);
+
+        // SAFETY: `address(ready)` is the fence's `AtomicU64` value.
+        unsafe { (*(address(ready) as *const AtomicU64)).store(4, Ordering::Release) };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while completed(done) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            completed(done),
+            1,
+            "held queue did not wake on direct write"
+        );
+
+        for object in [waits, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();

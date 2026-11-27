@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -47,45 +47,58 @@ pub(crate) fn counts() -> (u64, u64) {
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
-fn build() -> [u8; 32] {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
-    }
-    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
-    let exe = EXE.get_or_init(|| {
-        if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
-                    None
-                }
-            }
-        } else {
-            None
+fn build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let limit = victory_shader::emit::loop_limit();
+        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+            WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
         }
-    });
-    // The view heap's null slot is part of the translation (it differs
-    // by host GPU): found before it goes into the key, so a translation
-    // cached without the clamp is never served.
-    crate::descriptor::host::probe_view_limit();
-    let mut h = blake3::Hasher::new();
-    h.update(b"victory shader cache key 2\0");
-    if let Some(exe) = exe {
-        h.update(exe);
-    }
-    h.update(&victory_shader::emit::translation_fingerprint());
-    h.update(validator_id().as_bytes());
-    // The list this file reads for the translator (`translate_listed`): the
-    // shader crate's fingerprint does not see it.
-    h.update(b"VICTORY_WAVE_WIDE_ONLY=");
-    if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
-        h.update(value.as_encoded_bytes());
-    }
-    h.update(include_bytes!("shader_cache.rs"));
-    *h.finalize().as_bytes()
+        static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+        let exe = EXE.get_or_init(|| {
+            // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): the entries
+            // of another build, for a build whose translation is the same (a
+            // change elsewhere), which then need not be made again.
+            let other = std::env::var_os("VICTORY_SHADER_BUILD_OF")
+                .filter(|_| cfg!(feature = "diagnostics"))
+                .map(std::path::PathBuf::from);
+            if let Some(other) = &other {
+                tracing::warn!(of = %other.display(), "shader cache entries of another build are used");
+            }
+            if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") || other.is_some() {
+                match other.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read) {
+                    Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        });
+        // The view heap's null slot is part of the translation (it differs
+        // by host GPU): found before it goes into the key, so a translation
+        // cached without the clamp is never served.
+        crate::descriptor::host::probe_view_limit();
+        let mut h = blake3::Hasher::new();
+        h.update(b"victory shader cache key 2\0");
+        if let Some(exe) = exe {
+            h.update(exe);
+        }
+        h.update(&victory_shader::emit::translation_fingerprint());
+        h.update(&u8::from(victory_shader::emit::rays()).to_le_bytes());
+        h.update(validator_id().as_bytes());
+        // The list this file reads for the translator (`translate_listed`): the
+        // shader crate's fingerprint does not see it.
+        h.update(b"VICTORY_WAVE_WIDE_ONLY=");
+        if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
+            h.update(value.as_encoded_bytes());
+        }
+        h.update(include_bytes!("shader_cache.rs"));
+        *h.finalize().as_bytes()
+    })
 }
 
 /// A container translated with the wave-wide form allowed when its hash is
@@ -124,30 +137,33 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
         ran.store(true, Ordering::Relaxed);
         translate_listed(c)
     };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    // Reuse every other shader's regular cache. The diagnostic translation
-    // must never read or replace the cached uninstrumented shader.
-    if victory_shader::emit::ray_probe_enabled()
-        && &blake3::hash(container).to_hex()[..16] == victory_shader::emit::RAY_PROBE_HASH
-    {
-        return victory_shader::emit::translate_ray_probe(container).map_err(|e| e.to_string());
-    }
-    let translate = |c: &[u8]| {
-        let shader = translate_listed(c)?;
-        validate(&shader)?;
-        Ok(shader)
-    };
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one.
+pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => {
+            let mut key = key(build(), target);
+            // A container a diagnostic patch may apply to has entries of its
+            // own, by the patches.
+            let patches = victory_shader::native::diagnostic_patches();
+            if patches.iter().any(|p| p.0 == container.len()) {
+                let mut h = blake3::Hasher::new();
+                h.update(&key);
+                h.update(format!("{patches:?}").as_bytes());
+                key = *h.finalize().as_bytes();
+            }
+            cached(cache, &key, container, translate)
+        }
         None => translate(container),
     }
 }
 
+#[allow(dead_code)]
 /// Refuses a translation the DXIL validator (`dxil.dll`) rejects, before
 /// any driver sees it. AMD's RDNA 4 driver (RX 9060 XT and RX 9070 XT,
 /// 32.0.320xx) faults inside its shader compiler (`amdxc64.dll`, a read of
@@ -220,6 +236,22 @@ fn validator_id() -> String {
     "off".to_owned()
 }
 
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    // The clean-up passes are part of the translation; none leaves the key
+    // as it was before there were any.
+    let passes = victory_shader::emit::shader_opt();
+    if passes != 0 {
+        h.update(b"clean-up passes");
+        h.update(&passes.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
@@ -274,7 +306,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH3";
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -371,6 +403,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -450,6 +483,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -463,6 +497,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         writes_guest_memory,
         root_indexed_views,
         half_views,
+        stride_table,
     })
 }
 
@@ -500,6 +535,7 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            stride_table: true,
         }
     }
 
@@ -534,6 +570,22 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(key(&build, nvidia), key(&build, nvidia));
+        assert_ne!(key(&build, nvidia), key(&build, rdna));
+        assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

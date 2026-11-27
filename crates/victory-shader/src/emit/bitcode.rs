@@ -5,10 +5,11 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
+pub mod opt;
+
 use std::collections::HashMap;
 
 pub mod census;
-pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -55,6 +56,7 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
+    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -89,7 +91,6 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
-    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -108,10 +109,14 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    #[allow(dead_code)]
+    FpTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -162,6 +167,8 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
+    /// One of the type, per lane (a local array); the size constant.
+    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +251,47 @@ impl Module {
         Ty(t)
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_of(&self, target: V) -> usize {
+        let mut n = 0;
+        let mut count = |v: V| {
+            if v == target {
+                n += 1;
+            }
+        };
+        for inst in &self.insts {
+            match &inst.op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
+                    count(*a);
+                    count(*b);
+                }
+                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
+                Op::AtomicRmw(_, c, t) => {
+                    count(*c);
+                    count(*t);
+                }
+                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
+                    count(*c);
+                    count(*t);
+                    count(*f);
+                }
+                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
+                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
+                Op::Gep(_, base, idx) => {
+                    count(*base);
+                    idx.iter().for_each(|&v| count(v));
+                }
+                Op::Alloca(..) => {}
+            }
+        }
+        for block in &self.blocks {
+            if let Some(Term::CondBr(cond, _, _)) = block.term {
+                count(cond);
+            }
+        }
+        n
+    }
+
     pub fn void(&mut self) -> Ty {
         self.ty(TypeDef::Void)
     }
@@ -320,6 +368,7 @@ impl Module {
         self.constant(ty, Const::Aggregate(ids))
     }
 
+    #[allow(dead_code)]
     /// The value of an integer constant; `None` for anything else.
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
@@ -363,9 +412,15 @@ impl Module {
             ty,
             ptr,
             space,
+            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    pub fn align_global_to_eight(&mut self, global: V) {
+        let V::Global(n) = global else { unreachable!() };
+        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -394,6 +449,20 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    #[allow(dead_code)]
+    /// The bits of an integer or float constant (integers as stored,
+    /// sign-extended).
+    pub fn known(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                Const::Float(bits) => Some(i64::from(bits)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {
@@ -459,6 +528,7 @@ impl Module {
                 Op::Call(_, args) => args.iter().any(|&a| need_into(a)),
                 Op::Gep(_, v, ix) => need_into(*v) | ix.iter().any(|&a| need_into(a)),
                 Op::Phi(args) => args.iter().any(|&(a, _)| need_into(a)),
+                Op::Alloca(_, n) => need_into(*n),
             };
             if !into_it {
                 break;
@@ -640,6 +710,12 @@ impl Module {
         made
     }
 
+    /// Memory of type `ty` private to each lane (`alloca`), for the entry block.
+    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
+        let (ptr, one) = (self.ptr(ty), self.i32(1));
+        self.push(block, ptr, Op::Alloca(ty, one))
+    }
+
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
@@ -783,7 +859,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    3,
+                    g.align,
                     0,
                 ],
             );
@@ -1030,6 +1106,12 @@ impl Module {
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
                     }
+                    // [type, size type, size (absolute id), alignment 4
+                    // (log2 + 1) | explicit type (bit 6)].
+                    Op::Alloca(ty, n) => {
+                        let (nt, n) = (self.type_of(*n).0, abs(*n));
+                        w.record(19, &[u64::from(ty.0), u64::from(nt), u64::from(n), 3 | 64]);
+                    }
                 }
                 if !self.is_void(inst.ty) {
                     inst_id += 1;
@@ -1079,6 +1161,8 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*p);
             idx.iter().copied().for_each(f);
         }
+        // The size is a constant.
+        Op::Alloca(..) => {}
     }
 }
 

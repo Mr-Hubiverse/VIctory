@@ -418,7 +418,8 @@ mod tests {
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
-        };
+        
+            stride_table: false,};
         (
             host(crate::native::HwStage::Vs, vs),
             host(crate::native::HwStage::Ps, ps),

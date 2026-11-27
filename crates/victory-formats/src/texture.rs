@@ -575,6 +575,20 @@ impl Layout {
             + u64::from(self.pattern[0][(x % bw) as usize])
     }
 
+    /// Bytes from the texture's start that mips `first` and smaller take up
+    /// (of all slices). Mips are stored smallest first: titles that stream
+    /// textures give memory to the small ones only, and what follows is
+    /// another texture's, or nothing.
+    pub fn reach(&self, first: u32) -> u64 {
+        match first.min(self.first_tail_mip) {
+            0 => self.size,
+            k => match self.mips.get(k as usize - 1) {
+                Some(m) if m.offset != 0 => self.size - self.slice_size + m.offset,
+                _ => self.size,
+            },
+        }
+    }
+
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {

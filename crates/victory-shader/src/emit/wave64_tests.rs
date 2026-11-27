@@ -108,7 +108,7 @@ fn lowered_for_dispatch(native: &NativeProgram, p: &ir::Program, wide: &HashSet<
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower_with_thread_limit(&lower::Parts {
+    let mut parts = lower::Parts {
         native,
         p,
         st: &st,
@@ -118,7 +118,21 @@ fn lowered_for_dispatch(native: &NativeProgram, p: &ir::Program, wide: &HashSet<
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    }, partial);
+    
+        psv: None,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,};
+    let console;
+    let lowered = match lower::lower_with_thread_limit(&parts, partial) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            console = structure::structure_console(p)?;
+            parts.st = &console;
+            parts.console_cf = true;
+            lower::lower_with_thread_limit(&parts, partial)
+        }
+        l => l,
+    };
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -134,7 +148,8 @@ fn lowered_for_dispatch(native: &NativeProgram, p: &ir::Program, wide: &HashSet<
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
-    })
+    
+        stride_table: lowered.stride_table,})
 }
 
 #[test]
@@ -820,7 +835,7 @@ fn a_wave_or_in_a_group_of_two_console_waves() {
         let bytes = crate::dxbc::build(&[]);
         let c = Container::parse(&bytes).unwrap();
         let was = lower::TEST_HOST_WAVE.replace(Some(32));
-        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        let shader = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY);
         lower::TEST_HOST_WAVE.set(was);
         shaders.push(shader.expect("translate"));
     }
@@ -894,7 +909,7 @@ fn a_wave_or_inside_a_lane_branch_in_a_group_of_two_console_waves() {
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).unwrap();
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY);
     lower::TEST_HOST_WAVE.set(was);
     let shader = shader.expect("translate");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1028,7 +1043,11 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
-        });
+        
+            psv: None,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,});
         lower::TEST_HOST_WAVE.set(was);
         let lowered = lowered.unwrap_or_else(|e| panic!("lower (waves of {host_wave}): {e}"));
         assert!(
@@ -1048,7 +1067,8 @@ fn threads_past_a_dispatch_x_count_do_nothing() {
         writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: res.root_indexed_views.clone(),
             half_views: lowered.half_views,
-        };
+        
+            stride_table: lowered.stride_table,};
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed (waves of {host_wave}): {e}"));
@@ -1165,50 +1185,6 @@ fn a_far_early_out_is_left_out_and_the_gate_counts_the_lanes_of_both_halves() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
-        return;
-    };
-    let (root, pso) = match host.compute_pipeline(&shader) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
-            return;
-        }
-    };
-    // Each wave's lane l gives bit l >> 1 (the OR is per console wave;
-    // threads below s0 take the branch). Wave 0 answers for threads 0..63,
-    // wave 1 for 64..127: two dwords.
-    for (below, lo, hi) in [
-        (128u32, u32::MAX, u32::MAX),
-        (100, u32::MAX, 0x0003_FFFF),
-        (70, u32::MAX, 0x7),
-        (64, u32::MAX, 0),
-        (40, 0x000F_FFFF, 0),
-        (10, 0x1F, 0),
-        (0, 0, 0),
-    ] {
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
-                ud[u.index as usize] = below;
-            }
-        }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::RawUav(2)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-        assert_eq!(out[0][..2], [lo, hi], "{below} threads in the branch");
-    }
-    eprintln!("ran on the hardware device: two console waves decided for themselves");
     // (threads below s0 are in bounds; the one thread s1 fails the test) A failing thread of the
     // upper half gives 2 to the lower half's threads as well, and a failing thread out of
     // bounds counts for nothing

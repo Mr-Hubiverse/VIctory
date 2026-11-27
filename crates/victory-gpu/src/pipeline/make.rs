@@ -22,6 +22,15 @@
 //! long ([`held_too_long`]).
 //! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
 //! loading waits only).
+//! Passes over the screen (no vertex input, no depth) have workers and a
+//! longer budget of their own: the title fills its lighting tables with
+//! such draws once, at the world's first frame, and behind a world's worth
+//! of pipelines they waited minutes; a run that lost them had no diffuse
+//! light at all.
+//!
+//! shortcut: the budgets (half a second of waiting per title frame, 20 s
+//! for screen passes) are guesses; another pass the title runs only once
+//! and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -66,6 +75,10 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// Its worker was lost to it: it will not be made.
+    lost: AtomicBool,
+    /// A pass over the screen (see [`GraphicsState::screen_pass`]).
+    screen: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -77,8 +90,6 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`], [`stuck`]).
     begun: OnceLock<Instant>,
-    /// A pass over the screen ([`GraphicsState::screen_pass`]).
-    screen: bool,
     /// Whether a worker was started in place of the one making it ([`stuck`]).
     replaced: AtomicBool,
     /// Whether the made pipeline has gone to a draw or dispatch yet
@@ -171,10 +182,11 @@ impl Pending {
         }
         key.update(graphics_description.as_deref().unwrap_or_default().as_bytes());
         let left_out = left_out(&shaders);
-        let screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
+        let _screen = graphics.as_ref().is_some_and(|g| g.screen_pass());
         Pending {
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             identity,
@@ -183,9 +195,9 @@ impl Pending {
             replaced: AtomicBool::new(false),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            screen,
             handed: AtomicBool::new(false),
         }
     }
@@ -621,6 +633,10 @@ fn held_too_long(held: Duration, compute: bool, base: Duration) -> bool {
     base < most && held > most
 }
 
+#[allow(dead_code)]
+/// The same for passes over the screen (below the title's 30 s watchdog).
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -642,6 +658,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
+        if p.lost.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Also with a world's worth queued: passes the title runs only once
+        // set up what later ones loop over.
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
@@ -897,7 +918,7 @@ impl FrameWait {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let base = if screen { screen_budget() } else { wait_budget() };
@@ -986,7 +1007,30 @@ impl Queue {
             requested: VecDeque::new(),
         }
     }
+}
 
+/// What the workers (by thread) are making.
+static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
+
+/// A worker is lost to a compile that crashed or never ends: another takes
+/// its place (its pipeline stays unmade). With all of them lost, the rest of
+/// a world's pipelines waited forever.
+pub(super) fn worker_lost(id: u32) {
+    let mut lost = None;
+    AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
+        if w.0 == id {
+            w.1.lost.store(true, Ordering::Relaxed);
+            lost = Some(w.1.screen);
+        }
+        w.0 != id
+    });
+    if let Some(screen) = lost {
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+        let _ = spawn_worker(screen);
+    }
+}
+
+impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
@@ -1062,6 +1106,15 @@ fn next(screens_only: bool) -> Arc<Pending> {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = queue.pop(screens_only) {
+            return p;
+        }
+        // Woken for a pipeline only the other workers can take: `start`'s
+        // `notify_one` cannot pick a worker of the right kind. Hand the wake
+        // on to everyone before sleeping again, or it waits for good.
+        if screens_only {
+            AVAILABLE.notify_all();
+        }
     }
 }
 
@@ -1108,8 +1161,13 @@ fn spawn_worker(screens_only: bool) -> bool {
                 use windows::Win32::System::Threading::*;
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
+            // SAFETY: a plain call.
+            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             loop {
-                next(screens_only).make();
+                let p = next(screens_only);
+                AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
+                p.make();
+                AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != id);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {

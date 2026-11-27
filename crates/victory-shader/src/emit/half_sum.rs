@@ -169,6 +169,10 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            psv: None,
+            console_cf: false,
+            per_lane_only: false,
         });
         TEST_HOST_WAVE.set(None);
         r

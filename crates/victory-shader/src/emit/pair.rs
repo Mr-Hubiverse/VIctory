@@ -18,7 +18,7 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lds = self.s.lds();
+        let lds = self.s.lds(self.wide_lds);
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
@@ -55,7 +55,7 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
     pub(super) fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() {
+        if self.exchange.is_none() && !self.console_cf {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -107,7 +107,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.cont(at);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
+        let lds = self.s.lds(self.wide_lds);
         if self.pair_flags.is_some() {
             // A group of several console waves: only this wave's two host
             // waves may meet (a group barrier inside a branch the other
@@ -233,7 +233,7 @@ impl<'a> Lower<'a> {
         // The ticket counts of `pair_meet` start at 0 and groupshared is not
         // initialised: every thread zeroes its wave's four and the group
         // meets once, in the entry block every thread runs (`wave_base`).
-        let lds = self.s.lds();
+        let lds = self.s.lds(self.wide_lds);
         let zero = self.s.m.i32(0);
         for k in 0..4 {
             let kk = self.s.m.i32(k);
@@ -275,7 +275,7 @@ impl<'a> Lower<'a> {
         let my = self.s.m.bin(e, Bin::Add, my, half);
         let ot = self.s.m.bin(e, Bin::Add, base, k2k);
         let ot = self.s.m.bin(e, Bin::Add, ot, other);
-        let lds = self.s.lds();
+        let lds = self.s.lds(self.wide_lds);
         let mine = self.s.m.element(e, lds, my);
         let other = self.s.m.element(e, lds, ot);
         // this wave's writes before are seen by the other after

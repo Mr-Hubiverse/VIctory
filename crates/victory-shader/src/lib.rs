@@ -16,12 +16,14 @@ pub mod ir;
 pub mod native;
 pub mod resource;
 pub mod spill;
+pub mod sgpr_spill;
 pub mod structure;
+pub mod unspill;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
-    HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
+    HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, container_programs, native_programs,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -65,12 +67,17 @@ translation_inputs! {
     "emit/halves.rs",
     "emit/intersect.rs",
     "emit/lower.rs",
+    "emit/lower/control.rs",
+    "emit/lower/descriptors.rs",
+    "emit/lower/image.rs",
+    "emit/lower/valu.rs",
     "emit/mod.rs",
     "emit/own_bits.rs",
     "emit/packed_mask.rs",
     "emit/pair.rs",
     "emit/pops.rs",
     "emit/rect.rs",
+    "emit/rectangle.rs",
     "emit/sampler.rs",
     "emit/shader.rs",
     "emit/threading.rs",
@@ -86,8 +93,10 @@ translation_inputs! {
     "lib.rs",
     "native.rs",
     "resource.rs",
+    "sgpr_spill.rs",
     "spill.rs",
     "structure.rs",
+    "unspill.rs",
 }
 
 #[cfg(test)]
@@ -102,7 +111,17 @@ mod source_tests {
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",
         "emit/host.rs",
+        "emit/image_tests.rs",
         "emit/intersect_tests.rs",
+        "emit/lane_read_loop_tests.rs",
+        "emit/lds_tests.rs",
+        "emit/lower/select_tests.rs",
+        "emit/lower/tests.rs",
+        "emit/memory_tests.rs",
+        "emit/opcode_audit.rs",
+        "emit/opcode_tests.rs",
+        "emit/scratch_tests.rs",
+        "emit/split_tests.rs",
         "emit/valu_tests.rs",
         "emit/waterfall_tests.rs",
         "emit/wave64_tests.rs",

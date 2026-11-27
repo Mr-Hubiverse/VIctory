@@ -145,6 +145,8 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
+    /// The wave sizes to translate for.
+    target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -239,6 +241,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
@@ -262,14 +265,27 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    let mut target = emit::Target::ANY;
     if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        target = host.target();
         if emit::host_max_wave() == 0
             && let Some(max) = host.max_wave_lanes()
         {
             emit::set_host_max_wave(max);
-            println!("host waves   at most {max} lanes");
         }
+    }
+    if let Some((lanes_min, lanes_max)) = host_lanes {
+        target = emit::Target {
+            lanes_min,
+            lanes_max,
+        };
+    }
+    if target != emit::Target::ANY {
+        println!(
+            "host waves   {}-{} lanes",
+            target.lanes_min, target.lanes_max
+        );
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -303,6 +319,7 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
+                            target,
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
@@ -492,6 +509,27 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
     Ok(())
 }
 
+/// The instructions around `offset` (`VICTORY_AROUND=<count>`, before and
+/// half as many after), with the block each starts in.
+fn disassemble(p: &ir::Program, offset: usize) {
+    let Some(around) = std::env::var("VICTORY_AROUND").ok().and_then(|v| v.parse::<usize>().ok()) else {
+        return;
+    };
+    let all: Vec<(usize, &ir::Inst)> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, block)| block.insts.iter().map(move |i| (b, i)))
+        .collect();
+    let at = all
+        .iter()
+        .position(|(_, i)| i.machine.offset == offset)
+        .unwrap_or(0);
+    for (b, i) in &all[at.saturating_sub(around)..(at + around / 2).min(all.len())] {
+        println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
+    }
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -539,7 +577,11 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or_else(|| container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     // `~`: the hash of the code alone; containers that differ only around
@@ -572,7 +614,7 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    let programs = match victory_shader::container_programs(&container) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
@@ -616,22 +658,34 @@ fn translate(
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
-        // as `emit::translate` does for a host of 32-lane waves
-        let p = if emit::host_max_wave() == 32 { victory_shader::spill::thread_limited(p) } else { p };
-        match victory_shader::spill::build(&p) {
-            Ok(program) => {
+        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+            Ok(mut program) => {
+                if std::env::var_os("VICTORY_DISASM").is_some() {
+                    for (b, block) in program.blocks.iter().enumerate() {
+                        for i in &block.insts {
+                            println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
+                        }
+                    }
+                }
+                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
+                victory_shader::sgpr_spill::forward(&mut program);
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // Per-lane descriptors are traced on the per-lane form; its
-                // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
-                let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                // As `emit::translate_for`: by address where nothing else does.
+                let traces = resource::traces_rays(&program) && p.stage == HwStage::Cs;
+                let mut by_address = traces;
+                let mut tracked = resource::track_with(&program, &p.layout, p.stage, traces);
+                if tracked.is_err() && p.stage == HwStage::Cs {
+                    by_address = !traces;
+                    tracked = resource::track_with(&program, &p.layout, p.stage, by_address);
+                }
+                let res = match tracked {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
+                        disassemble(&program, offset);
                         t.fail(format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
@@ -661,7 +715,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
-                let structured = match structured {
+                let structured = match structure::structure(&program) {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
                         Some(s)
@@ -679,16 +733,29 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    let mut made = emit::emit(container, &p, &program, &s, &i, &r, checks.target);
+                    if matches!(made, Err(ShaderError::Unsupported { .. }))
+                        && p.stage == HwStage::Cs
+                        && let Ok(r) =
+                            resource::track_with(&program, &p.layout, p.stage, !by_address)
+                    {
+                        let other = emit::emit(container, &p, &program, &s, &i, &r, checks.target);
+                        if other.is_ok() || !by_address {
+                            made = other;
+                        }
+                    }
+                    match made {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            disassemble(&program, offset);
+                            t.fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
-                            }),
+                            })
+                        }
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
@@ -918,6 +985,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.dynamic += usize::from(address.dynamic.is_some());
                 Some(address)
             }
+            resource::Source::Address | resource::Source::Carried { .. } => None,
             resource::Source::Constant(_) => {
                 t.constant += 1;
                 None
