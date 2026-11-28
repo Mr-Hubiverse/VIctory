@@ -15,111 +15,127 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
-mod backreads;
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod cardmeter;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod renderdoc;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod shot;
-mod card;
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
+mod faultbook;
+#[cfg(windows)]
+mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
-mod drvwatch;
-#[cfg(windows)]
-mod fpsbox;
-#[cfg(windows)]
-mod stats;
-#[cfg(windows)]
-mod spread;
-#[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
-#[cfg_attr(not(windows), allow(dead_code))]
-mod heap_pass;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
 #[cfg(windows)]
-pub mod framelog;
-#[cfg(windows)]
-mod heap_worker;
+mod heap_marks;
 #[cfg(windows)]
 mod host;
+/// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
+/// (read by the input module).
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
-mod material_demand;
+mod port;
+#[cfg(windows)]
+mod land;
 pub mod list;
-#[cfg(windows)]
-mod memwait;
-#[cfg(windows)]
-mod memory;
-pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod plaincopy;
+mod picked;
+#[cfg(windows)]
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod replay;
 #[cfg(windows)]
-mod queue2;
-mod readout;
-#[cfg(windows)]
-mod rects;
+mod residency;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
-mod ambient;
-#[cfg(windows)]
-mod compose;
-#[cfg(windows)]
-mod twin;
-#[cfg(windows)]
-mod texpool;
+mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
 #[cfg(windows)]
-#[allow(dead_code)]
-mod timeline;
+pub mod titlewrite;
+#[cfg(windows)]
+mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod texback;
-#[cfg(windows)]
-mod writeback;
 
 #[cfg(windows)]
 pub use host::on_failure;
-pub use memstat::report as memory_report;
+/// Reserves the address space for memory shaders read by address; call it
+/// first thing, before the process's other allocations can fill [4 GiB, 2^37).
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use upload::reserve_space as reserve_upload_space;
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
+
+/// What the frame is at (`copystat::phase`), for the sampling profiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn frame_phase() -> u32 {
+    copystat::phase()
+}
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
+#[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
-    title_memory_arrived, title_memory_remapping_range, title_memory_view_gone,
-    title_memory_written,
-    writing as kernel_will_write,
+    SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };

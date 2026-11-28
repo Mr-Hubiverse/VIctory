@@ -1,0 +1,83 @@
+##### HUNK 41 #####
+--- OURS ---
+    use super::{WINDOW, cover, grid, holder, holder_below, longest_tail, tail_of, window_of};
+
+    /// An ask that found no window of its own takes one that holds all of
+    /// it: the longest the two kinds of ask make in one cell differ, so
+    /// without this the same title memory was copied once for each.
+    #[test]
+    fn an_ask_takes_a_window_that_holds_it() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x9_0000, cell + 0xb_0000);
+        let lowest = cell;
+        assert_eq!(holder_below([].into_iter(), lowest, ask, end), None);
+        let there = [
+            (cell, 0x4_0000),             // ends below the ask
+            (cell + 0x8_0000, 0x2_0000),  // holds its first half only
+            (cell + 0x8_0000, 0x4_0000),  // holds it
+            (cell + 0x4_0000, 0x10_0000), // holds it, lower down
+            (cell + 0xa_0000, 0x40_0000), // begins above it
+        ];
+        // The first that begins at or below the ask and holds it all.
+        assert_eq!(holder_below(there.into_iter(), lowest, ask, end), Some((cell + 0x4_0000, 0x10_0000)));
+        // None below `lowest`, however well it holds the ask.
+        assert_eq!(holder_below(there.into_iter(), cell + 0x8_0000, ask, end), Some((cell + 0x8_0000, 0x4_0000)));
+    }
+
+    /// An ask takes no window that begins below the lowest it may take, and
+    /// none that ends in the middle of it.
+    #[test]
+    fn a_window_must_begin_no_lower_than_the_ask_allows() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x2_0000, cell + 0x3_0000);
+        let there = [(cell, 0x10_0000), (cell + 0x1_0000, 0x10_0000)];
+        assert_eq!(holder_below(there.into_iter(), cell + 0x1_0000, ask, end), Some((cell + 0x1_0000, 0x10_0000)));
+        assert_eq!(holder_below(there.into_iter(), cell + 0x2_0000, ask, end), None);
+
+--- THEIRS ---
+    use super::{
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        tail_of, window_of,
+    };
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        // Unknown (WARP / query failure): the old baseline. <= 12 GiB: 18% of
+        // the budget, 512 to 2048 MiB.
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(2 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 1474));
+        assert_eq!(default_card_limits_mb(Some(11229 * MIB)), (16, 2021));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
+
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+
+        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+
+        // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    #[test]
+    fn window_room_follows_the_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::default_window_card_mb(None), 0);
+        assert_eq!(super::default_window_card_mb(Some(6 * GIB)), 0);
+        assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
+        assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
+        assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
+

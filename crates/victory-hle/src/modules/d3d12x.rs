@@ -19,15 +19,9 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
-    // A host driver that faults while compiling a pipeline: the report
-    // names the pipelines being made.
-    #[cfg(windows)]
-    {
-        static ADDED: std::sync::Once = std::sync::Once::new();
-        ADDED.call_once(|| victory_loader::add_crash_context(victory_gpu::pipeline::being_made));
-    }
     device::create(adapter, parameters, iid, out)
 }
 
@@ -43,11 +37,26 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::warm(container)
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {
@@ -67,21 +76,6 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     }
     #[cfg(not(windows))]
     let _ = dir;
-}
-
-#[cfg(windows)]
-pub use victory_gpu::pipeline::{check_preload_device, save_pipeline_cache, warm};
-
-/// Detect the adapter settings used by the runtime shader cache.
-pub fn prepare_shader_warmup() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        victory_gpu::pipeline::prepare_shader_warmup()
-    }
-    #[cfg(not(windows))]
-    {
-        Err("shader warm-up requires a D3D12 device on Windows".into())
-    }
 }
 
 pub(crate) fn module() -> HleModule {

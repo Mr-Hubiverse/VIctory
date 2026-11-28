@@ -1,0 +1,55 @@
+        if queued_write.is_some() && let View::Placed(false, resource, desc) = &view {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            if placed.displaced.get(&index) == Some(&key) {
+                // The ordinary sweep can enqueue from an older heap snapshot.
+                // Only install a displaced view once its exact span was
+                // reclaimed. A later alias revokes that claim under 'made'.
+                let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let span = placed.bytes(resource, crate::resource::first_mip(desc))
+                    .map(|bytes| (start, start.saturating_add(bytes)));
+                if span.is_none() || placed.by_slot.get(&index) != span.as_ref() {
+                    return Ok(None);
+                }
+            }
+        }
+        // A title can replace the resource at a placed UAV's address without
+        // changing a single byte of its descriptors (including its SRV).
+        let changed_owner = made[index as usize] == key && for_draw && match &view {
+            View::Placed(_, r, _) if r[0] != 1 && r[12] & 4 != 0 => !self.shows_placed_owner(index, &view),
+            _ => !self.buffer_owner_current(index, &view),
+        };
+        let current = made[index as usize] == key && !changed_owner;
+        if !allow(&view, current) {
+            return Err(());
+        }
+        if !current {
+            #[cfg(feature = "diagnostics")]
+            held.slot_changed();
+            // Being made again: not "made" to a reader without the lock
+            // until it is (the store after `keep` below).
+            self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
+            // Views of other textures in the memory this one describes
+            // are stale: their host slots read nothing from here on, and
+            // let go of the host copies they held.
+            #[cfg(feature = "diagnostics")]
+            let noting = std::time::Instant::now();
+            let stale = self.note_buffer(index, Some(&view), for_draw);
+            if !stale.is_empty() {
+                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+                for &slot in &stale {
+                    let key = made[slot as usize];
+                    if slot != index && key != 0 {
+                        placed.displaced.insert(slot, key);
+                    }
+                }
+                drop(placed);
+            }
+            for stale in stale {
+                if stale != index {
+                    self.unmake(&mut made, stale);
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if mirror_timing() {
+                MIRROR_US[0].fetch_add(noting.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }

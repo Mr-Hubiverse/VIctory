@@ -1,0 +1,64 @@
+/// The queue of textures picked by index, locked by place `site`
+/// (`super::queue_site`): for the places that hold it for many slots at a
+/// time, how long it was held is counted when it is let go.
+struct QueueGuard<'a> {
+    queue: std::sync::MutexGuard<'a, TextureQueue>,
+    held: Option<(usize, std::time::Instant)>,
+}
+
+impl std::ops::Deref for QueueGuard<'_> {
+    type Target = TextureQueue;
+    fn deref(&self) -> &TextureQueue {
+        &self.queue
+    }
+}
+
+impl std::ops::DerefMut for QueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TextureQueue {
+        &mut self.queue
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((site, since)) = self.held {
+            super::QUEUE_LOCK[2][site].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl HostHeap {
+    /// The queue of textures picked by index, locked by place `site`
+    /// (`super::queue_site`); the lock taken, a wait for it, and how long
+    /// the places that hold it for many slots held it are counted
+    /// (`super::LOCK_WAITS`, `super::QUEUE_LOCK`).
+    fn queue(&self, site: usize) -> QueueGuard<'_> {
+        use super::queue_site::{DUE, MADE_DUE, STALE};
+        use std::sync::atomic::Ordering::Relaxed;
+        let queue = match self.textures.try_lock() {
+            Ok(queue) => queue,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = std::time::Instant::now();
+                let queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                super::QUEUE_LOCK[1][site].fetch_add(super::waited(0, started), Relaxed);
+                queue
+            }
+        };
+        super::QUEUE_LOCK[0][site].fetch_add(1, Relaxed);
+        let held = matches!(site, DUE | MADE_DUE | STALE).then(|| (site, std::time::Instant::now()));
+        QueueGuard { queue, held }
+    }
+
+    /// Whether the queue holds title slot `index`, by its marks
+    /// ([`QueueMarks`]), without its lock; `None`: ask the queue (the marks
+    /// are not used, or do not reach the slot).
+    fn queued(&self, index: u32) -> Option<bool> {
+        if !queue_marks() {
+            return None;
+        }
+        self.marks.get(index).map(|write| write != 0)
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only), taken until
+    /// [`HostHeap::release`]: the first's index.

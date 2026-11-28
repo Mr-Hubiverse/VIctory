@@ -1,0 +1,48 @@
+        let stride = view.and_then(view_stride);
+        if let Some((_, mapping)) = self.addresses.get() {
+            let address = view.and_then(guest_srv_address).unwrap_or(0);
+            // SAFETY: note_buffer runs under the slot lock for a valid title slot.
+            unsafe { (*mapping as *mut u64).add(index as usize + 2).write_volatile(address) };
+        }
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(slot_word(view)) };
+        }
+        if let Some((_, _, data)) = &self.marks
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The slot's mark entry: the page bit and page offset of the
+            // view's first byte, where the copy it is of marks its pages
+            // (`Shadow::mark_entry`); none where it does not (not a copy,
+            // or in the card's memory). Base `VIEW_MARK_NONE`: the shader
+            // marks nothing and the range is declared.
+            let (base, phase) = view
+                .and_then(buffer_copy)
+                .and_then(|(shadow, address, _)| shadow.mark_entry(address))
+                .unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword pair, either value is one the slot had).
+            unsafe {
+                let at = (*data as *mut u32).add(index as usize * 2);
+                at.write_volatile(base);
+                at.add(1).write_volatile(phase);
+            }
+        }
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let location = view.and_then(acceleration_location);
+        let previous = if let Some(location) = location {
+            buffers.acceleration.insert(index, location)
+        } else {
+            buffers.acceleration.remove(&index)
+        };
+        if previous != location {
+            buffers.acceleration_locations = None;
+        }
+        let was = if stride.is_some() {
+            buffers.indices.insert(index);
+            true
+        } else {
+            buffers.indices.remove(&index)

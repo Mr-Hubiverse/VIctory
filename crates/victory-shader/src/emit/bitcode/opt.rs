@@ -1,7 +1,3 @@
-//! From the VIctory fork at commit ba8697aa (its `emit/bitcode/opt.rs`,
-//! GPL-3.0-or-later), adapted to this tree's module: local arrays and
-//! doubles, and no first-lane pass.
-//!
 //! Clean-up of a finished module before it is written: the lowering emits
 //! one instruction after another as the console code names them, and
 //! nothing stands between it and the driver's compiler. Every pass here is
@@ -34,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -59,10 +55,10 @@ pub const FIRST: u32 = 32;
 /// Not a pass over the module either: the lowering reads the dwords of one
 /// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
 /// `global_load_dwordx2` to `x4`) by one call for every four of them, not
-/// by a call each (`lower.rs`, `raw_dwords`). NOT the same result on the card in every case: run 277
-/// had the water black with it (lead: a four-dword load whose last dwords
-/// lie past the view's end, which the card may answer with zeros for the
-/// whole call), so it stays off unless asked for.
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/victory-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
@@ -79,11 +75,12 @@ pub const DEFAULT: u32 = ALL & !WIDE;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A rasterizer ordered view.
+    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
-    pub rovs: bool,
     /// A handle from the view heap.
     pub heap_views: bool,
     /// A handle from the sampler heap.
@@ -190,8 +187,6 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *p = f(*p);
             idx.iter_mut().for_each(|i| *i = f(*i));
         }
-        // The size is a constant.
-        Op::Alloca(..) => {}
     }
 }
 
@@ -215,26 +210,7 @@ pub(super) enum Effect {
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
-        // Dynamic descriptor heap handles and their annotations must not be
-        // reused across basic blocks by dominator-tree CSE: AMD's D3D12
-        // compiler (amdxc64.dll on RDNA 4) dereferences null when an
-        // `annotateHandle(createHandleFromHeap(...))` is shared across
-        // control-flow blocks. Keeping them as `Effect::Lanes` still allows
-        // same-block deduplication and dead-code elimination.
-        Some(Attr::ReadNone)
-            if name == "createHandleFromHeap" || name == "annotateHandle" =>
-        {
-            Effect::Lanes
-        }
         Some(Attr::ReadNone) => Effect::Pure,
-        // A shader cannot write a constant buffer.
-        Some(Attr::ReadOnly) if name.starts_with("cbufferLoadLegacy") => Effect::Pure,
-        // Nor resize a resource, but a size is reused within its block only
-        // ([`LOADS`], not [`REUSE`]): one size read in later blocks too
-        // made AMD's RDNA 4 compiler (amdxc64 for gfx1201) fault while
-        // building a ray-tracing resolve program of the title, which RDNA 3's
-        // builds (see also `own_heap_handles`).
-        Some(Attr::ReadOnly) if name.starts_with("getDimensions") => Effect::Reads,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
             if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
@@ -253,122 +229,23 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 && !self.blocks.is_empty() {
-            let effects = self.effects();
-            let mut tree = None;
+        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
             for _ in 0..4 {
-                let analysis = tree.get_or_insert_with(|| self.dominator_tree());
-                let mut changed = self.merge(passes, &effects, analysis);
-                if passes & FOLD != 0 && self.prune() {
-                    tree = None;
-                    changed = true;
+                let mut changed = self.merge(passes);
+                if passes & FOLD != 0 {
+                    changed |= self.prune();
                 }
                 if !changed {
                     break;
                 }
             }
         }
-        // Before the dead-code pass: a heap handle no annotation reads any
-        // more goes with it.
-        self.own_heap_handles();
         if passes & DEAD != 0 {
             self.drop_dead();
         }
-    }
-
-    /// Undoes what [`REUSE`] merged of heap handles: an annotation that
-    /// reads a handle another annotation reads too, or one made in another
-    /// block, gets a handle of its own made just before it, from an index
-    /// of its own where that is arithmetic. The lowering makes a handle
-    /// beside each annotation; merged, one handle (or one index value) was
-    /// annotated as two kinds where the title reads a descriptor two ways
-    /// (a raw buffer and a structured or constant buffer), or read across
-    /// blocks. The DXIL validator accepts that and RDNA 3's compiler builds
-    /// it, but AMD's RDNA 4 compiler (amdxc64 for gfx1201) faults while
-    /// building such pipelines (a ray-tracing resolve and a tree-animation
-    /// skinning program of the title). Annotated handles stay merged.
-    fn own_heap_handles(&mut self) {
-        let (Some(&heap), Some(&annotate)) = (
-            self.func_ids.get("dx.op.createHandleFromHeap"),
-            self.func_ids.get("dx.op.annotateHandle"),
-        ) else {
-            return;
-        };
-        // Each heap handle's block.
-        let mut home: HashMap<u32, usize> = HashMap::new();
-        for (b, block) in self.blocks.iter().enumerate() {
-            for &i in &block.body {
-                if let Op::Call(f, args) = &self.insts[i as usize].op
-                    && *f == heap
-                    && args.len() == 4
-                {
-                    home.insert(i, b);
-                }
-            }
-        }
-        // The annotations that read a heap handle another one reads too, or
-        // one made in another block: the first in the handle's own block
-        // keeps it.
-        let mut kept: HashSet<u32> = HashSet::new();
-        let mut moved: Vec<(usize, u32, u32)> = Vec::new();
-        for (b, block) in self.blocks.iter().enumerate() {
-            for &a in &block.body {
-                let Op::Call(f, args) = &self.insts[a as usize].op else { continue };
-                if *f != annotate || args.len() != 3 {
-                    continue;
-                }
-                let V::Inst(h) = args[1] else { continue };
-                let Some(&made) = home.get(&h) else { continue };
-                if made == b && kept.insert(h) {
-                    continue;
-                }
-                moved.push((b, a, h));
-            }
-        }
-        for (b, a, h) in moved {
-            let Op::Call(_, args) = &self.insts[h as usize].op else { continue };
-            let index = args[1];
-            // The index made again too where it is arithmetic on values
-            // every path has (not a join, nor a call such as a wave
-            // operation, which answers for the lanes where it stands).
-            let index = match index {
-                V::Inst(d) if matches!(self.insts[d as usize].op, Op::Bin(..) | Op::Cast(..)) => {
-                    self.copy_before(d, b, a)
-                }
-                other => other,
-            };
-            let mine = self.copy_before(h, b, a);
-            if let V::Inst(m) = mine
-                && let Op::Call(_, args) = &mut self.insts[m as usize].op
-            {
-                args[1] = index;
-            }
-            if let Op::Call(_, args) = &mut self.insts[a as usize].op {
-                args[1] = mine;
-            }
-        }
-    }
-
-    /// A copy of instruction `i`, placed in block `b` just before
-    /// instruction `at` (which `i` reaches: what `i` reads stands there).
-    fn copy_before(&mut self, i: u32, b: usize, at: u32) -> V {
-        let copy = self.insts.len() as u32;
-        let inst = super::Inst {
-            ty: self.insts[i as usize].ty,
-            op: self.insts[i as usize].op.clone(),
-        };
-        self.insts.push(inst);
-        self.inst_block.push(b as u32);
-        if let Some(&tag) = self.tags.get(&i) {
-            self.tags.insert(copy, tag);
-        }
-        let body = &mut self.blocks[b].body;
-        let position = body.iter().position(|&x| x == at).expect("`at` is in block `b`");
-        body.insert(position, copy);
-        V::Inst(copy)
     }
 
     /// Per function: what a call of it does.
@@ -517,10 +394,6 @@ impl Module {
         }
     }
 
-    fn is_undef(&self, v: V) -> bool {
-        matches!(v, V::Const(c) if matches!(self.consts[c as usize].1, Const::Undef))
-    }
-
     fn int_bits(&self, ty: Ty) -> Option<u32> {
         match self.types[ty.0 as usize] {
             TypeDef::Int(bits) => Some(bits),
@@ -529,13 +402,89 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
         };
         let bits = self.int_bits(*ty)?;
         Some((bits, *x as u64 & mask(bits)))
+    }
+
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
@@ -607,9 +556,6 @@ impl Module {
                     return None;
                 };
                 let (x, y) = (f32::from_bits(*x), f32::from_bits(*y));
-                if !matches!(self.types[self.type_of(a).0 as usize], TypeDef::Float) {
-                    return None;
-                }
                 let unordered = x.is_nan() || y.is_nan();
                 // Bits 0-2 of a predicate: equal, greater, less; bit 3:
                 // or unordered.
@@ -716,10 +662,7 @@ impl Module {
                             Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
                                 Some(self.f32(bits as u32))
                             }
-                            Const::Float(bits)
-                                if self.int_bits(ty) == Some(32)
-                                    && matches!(self.types[from.0 as usize], TypeDef::Float) =>
-                            {
+                            Const::Float(bits) if self.int_bits(ty) == Some(32) => {
                                 Some(self.int_const(ty, i64::from(bits as i32)))
                             }
                             _ => None,
@@ -776,8 +719,6 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
-            // Each is memory of its own: never one for another (no key).
-            Op::Alloca(..) => Effect::Lanes,
             Op::Call(f, _) => effects[*f as usize],
         }
     }
@@ -811,7 +752,12 @@ impl Module {
 
     /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
     /// dominator tree. Returns whether anything changed.
-    fn merge(&mut self, passes: u32, effects: &[Effect], tree: &Tree) -> bool {
+    fn merge(&mut self, passes: u32) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        let effects = self.effects();
+        let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -841,13 +787,7 @@ impl Module {
                                 Some(_) => same = false,
                             }
                         }
-                        // Not by an undefined value: this tree's lowering
-                        // joins a register nothing writes with itself, and
-                        // what read the join would read the undefined value
-                        // itself, which the validator refuses.
-                        if let (true, Some(v)) = (same, one)
-                            && !self.is_undef(v)
-                        {
+                        if let (true, Some(v)) = (same, one) {
                             repl[p as usize] = Some(v);
                             again = true;
                             changed = true;
@@ -949,14 +889,12 @@ impl Module {
                 }
                 if passes & FOLD != 0
                     && let Some(v) = self.simplify(i, &mut changed)
-                    && !self.is_undef(v)
                 {
                     repl[i as usize] = Some(v);
                     changed = true;
                     continue;
                 }
-                let _class = self.class(effects, i);
-                let class = self.class(effects, i);
+                let class = self.class(&effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
@@ -1102,23 +1040,6 @@ impl Module {
                 mark(&mut live, &mut work, v)
             });
         }
-        // Diagnostics (`VICTORY_SHADER_OPT_TRACE=1`): the calls that leave,
-        // by function, on the error output.
-        if std::env::var_os("VICTORY_SHADER_OPT_TRACE").is_some() {
-            let mut gone: std::collections::BTreeMap<String, u32> = Default::default();
-            for (b, blk) in self.blocks.iter().enumerate() {
-                for &i in blk.body.iter().filter(|&&i| !reached[b] || !live[i as usize]) {
-                    let what = match &self.insts[i as usize].op {
-                        Op::Call(f, _) => self.funcs[*f as usize].name.clone(),
-                        Op::Load(_) => "load".into(),
-                        Op::Alloca(..) => "alloca".into(),
-                        _ => continue,
-                    };
-                    *gone.entry(what).or_default() += 1;
-                }
-            }
-            eprintln!("clean-up: calls dropped as dead: {gone:?}");
-        }
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {
                 blk.body.retain(|&i| live[i as usize]);
@@ -1171,15 +1092,15 @@ impl Module {
                 };
                 let name = self.funcs[*f as usize].name.as_str();
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if name == "annotateHandle" {
-                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
-                } else if name.starts_with("wave") || name.starts_with("quad") {
+                if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
@@ -1329,86 +1250,6 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
-    }
-
-    /// One descriptor address made a heap handle twice, annotated as
-    /// `first` in block `b` and as `second` in block `b` or, with `apart`,
-    /// in the block after it, then the clean-up. For each annotation: its
-    /// block, its handle, and that handle's index and block.
-    fn heap_reads(first: u32, second: u32, apart: bool) -> Vec<(usize, V, V, usize)> {
-        let Kit {
-            mut m, b, reads, writes, ..
-        } = kit();
-        let i32t = m.int(32);
-        let heap_ty = m.func_ty(i32t, vec![i32t, i32t, i32t, i32t]);
-        m.ptr(heap_ty);
-        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
-        let note_ty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
-        m.ptr(note_ty);
-        let note = m.function("dx.op.annotateHandle", note_ty, Some(Attr::ReadNone), false);
-        let (zero, five, k218, k216) = (m.i32(0), m.i32(5), m.i32(218), m.i32(216));
-        let (first, second) = (m.i32(first), m.i32(second));
-        let next = if apart { m.new_block() } else { b };
-        // A descriptor address read from memory, made a heap index twice.
-        let address = m.call(b, reads, vec![zero, zero]);
-        let mut annotated = Vec::new();
-        for (block, props) in [(b, first), (next, second)] {
-            let index = m.bin(block, Bin::LShr, address, five);
-            let h = m.call(block, heap, vec![k218, index, zero, zero]);
-            annotated.push(m.call(block, note, vec![k216, h, props]));
-        }
-        if apart {
-            m.terminate(b, Term::Br(next));
-        }
-        m.call(next, writes, annotated);
-        m.terminate(next, Term::Ret);
-        m.optimise(MODULE);
-        m.write();
-        let block_of = |m: &Module, v: V| {
-            let V::Inst(i) = v else { panic!("an instruction") };
-            m.blocks.iter().position(|blk| blk.body.contains(&i)).expect("in a block")
-        };
-        let operand = |m: &Module, v: V| {
-            let V::Inst(i) = v else { panic!("an instruction") };
-            let Op::Call(_, args) = &m.insts[i as usize].op else { panic!("a call") };
-            args[1]
-        };
-        // The store is the last instruction; it reads the annotations.
-        let &store = m.blocks[next].body.last().expect("the store");
-        let Op::Call(_, stored) = &m.insts[store as usize].op else { panic!("a call") };
-        stored
-            .iter()
-            .map(|&a| {
-                let h = operand(&m, a);
-                (block_of(&m, a), h, operand(&m, h), block_of(&m, h))
-            })
-            .collect()
-    }
-
-    /// [`REUSE`] merges a heap handle read as two kinds; each kind's
-    /// annotation gets a handle and an index of its own back (AMD's RDNA 4
-    /// compiler faulted on shared ones). Read as one kind twice, the
-    /// annotation itself is merged and stays one.
-    #[test]
-    fn each_heap_annotation_reads_a_handle_and_index_of_its_own() {
-        let reads = heap_reads(11, 12, false);
-        let [(_, h1, i1, _), (_, h2, i2, _)] = reads[..] else { panic!("two annotations") };
-        assert_ne!(h1, h2, "a handle each");
-        assert_ne!(i1, i2, "an index each");
-        let reads = heap_reads(11, 11, false);
-        let [(_, h1, ..), (_, h2, ..)] = reads[..] else { panic!("two annotations") };
-        assert_eq!(h1, h2, "one kind: one handle");
-    }
-
-    /// A heap handle merged into one made in an earlier block is made again
-    /// in the block of the annotation that reads it.
-    #[test]
-    fn a_heap_handle_is_made_in_the_block_that_annotates_it() {
-        let reads = heap_reads(11, 12, true);
-        let [(b1, h1, _, hb1), (b2, h2, _, hb2)] = reads[..] else { panic!("two annotations") };
-        assert_ne!(b1, b2);
-        assert_ne!(h1, h2);
-        assert_eq!((hb1, hb2), (b1, b2), "each handle in its annotation's block");
     }
 
     #[test]
@@ -1872,61 +1713,6 @@ mod tests {
         let stores = stores(&m, join);
         assert_eq!(stores[0], [x, p]);
         assert_eq!(stores[1][1], p);
-        m.write();
-    }
-
-    #[test]
-    fn heap_handles_are_not_reused_across_blocks() {
-        let Diamond {
-            k: Kit { mut m, b, writes, .. },
-            then,
-            ..
-        } = diamond();
-        let i32t = m.int(32);
-        let hty = m.func_ty(i32t, vec![i32t, i32t]);
-        let heap = m.function(
-            "dx.op.createHandleFromHeap",
-            hty,
-            Some(Attr::ReadNone),
-            false,
-        );
-        let ann = m.function("dx.op.annotateHandle", hty, Some(Attr::ReadNone), false);
-        let one = m.i32(1);
-        let two = m.i32(2);
-
-        // Two identical heap handle + annotate pairs in the entry block:
-        // deduplicated within the same block.
-        let h1 = m.call(b, heap, vec![one, two]);
-        let a1 = m.call(b, ann, vec![h1, one]);
-        let h2 = m.call(b, heap, vec![one, two]);
-        let a2 = m.call(b, ann, vec![h2, one]);
-        m.call(b, writes, vec![a1, a2]);
-
-        // An identical pair in a dominated child block: must NOT be reused
-        // across blocks (AMD's RDNA 4 compiler crashes on cross-block CSE of
-        // dynamic descriptor heap handles).
-        let h3 = m.call(then, heap, vec![one, two]);
-        let a3 = m.call(then, ann, vec![h3, one]);
-        m.call(then, writes, vec![a3, a3]);
-
-        // An unused pair: still dropped by DEAD.
-        let h_dead = m.call(then, heap, vec![two, two]);
-        let _a_dead = m.call(then, ann, vec![h_dead, one]);
-
-        m.optimise(REUSE | LOADS | DEAD);
-        assert_eq!(stores(&m, b)[0], [a1, a1], "same-block handle is reused");
-        assert_eq!(
-            stores(&m, then)[0],
-            [a3, a3],
-            "cross-block handle is kept local to its block"
-        );
-        assert!(
-            !m.blocks[then].body.contains(&match h_dead {
-                V::Inst(i) => i,
-                _ => unreachable!(),
-            }),
-            "unused heap handle is still dropped by DEAD"
-        );
         m.write();
     }
 

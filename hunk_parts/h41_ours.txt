@@ -1,0 +1,15 @@
+        let kept = make(view, self.cpu(index));
+        let ok = kept.is_some();
+        if !ok {
+            if self.sampler {
+                self.null_sampler(index);
+            } else {
+                null_for(view, self.cpu(index));
+            }
+        }
+        self.keep_with_view(index, kept.flatten(), view);
+        if ok {
+            self.set_stride_count(index, view_stride(view).unwrap_or(0), view_count(view));
+        } else {
+            self.set_stride(index, 0);
+        }

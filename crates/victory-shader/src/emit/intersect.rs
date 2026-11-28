@@ -37,33 +37,6 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
-    /// The tests' way to translate as with `VICTORY_BVH_NO_HIT=1`
-    /// ([`no_hit`]).
-    pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether a node test answers "no hit" and reads nothing
-/// (`VICTORY_BVH_NO_HIT=1`; off by default; never with
-/// `VICTORY_BVH_BUILDER=1`, which has the structures built).
-///
-/// The title's structure builder does not run in the layer unless asked
-/// for, and the title's ray-traced passes run all the same: each node test
-/// then reads whatever bytes lie where a structure would be, in a walk the
-/// title bounds at 65,535 steps a wave. What comes back is not the scene:
-/// it differs from launch to launch, and how long a pass runs depends on
-/// those bytes. With the switch a box node enters no child and any other
-/// node is missed, as in a scene with nothing in it: every ray leaves at
-/// its first test, shadow rays find no occluder, and the answer is the same
-/// in every run. (The idea is fork pull request #994's, which asks a host
-/// word at run time; here it is a translation, since the builder's state
-/// does not change during a run of ours.)
-fn no_hit() -> bool {
-    #[cfg(test)]
-    if TEST_NO_HIT.get() {
-        return true;
-    }
-    std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
-        && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
 }
 
 /// Where the instruction's node is.
@@ -73,15 +46,9 @@ enum NodeAt {
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
-    /// and the node's address, for the second half of a 128-byte node.
-    Memory {
-        handle: V,
-        byte: V,
-        low: V,
-        high: V,
-        mapped: V,
-        slot: V,
-    },
+    /// the node's address, for the second half of a 128-byte node, and
+    /// whether there is a copy.
+    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
 }
 
 /// The ray operands, as floats.
@@ -168,22 +135,6 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
-        if no_hit() {
-            // No structures: a box enters no child, anything else is
-            // missed ([`no_hit`]). Nothing is read, and nothing asked of
-            // the directory of title memory.
-            let _ = &ray;
-            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
-            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
-            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
-            let none = self.s.m.i32(bvh::NONE);
-            for (k, miss) in bvh::MISS.into_iter().enumerate() {
-                let miss = self.s.m.i32(miss.to_bits());
-                let r = self.s.m.select(c, is_box, none, miss);
-                self.write(inst, Reg::V(dst + k as u8), r, guard);
-            }
-            return Ok(());
-        }
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -213,24 +164,18 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (slot, byte, mapped) = self.bvh_memory(low, high, guard);
-                let handle = self.bvh_handle(slot);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
-                    slot,
                 }
             }
         };
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
-        let probe = crate::emit::RAY_PROBE.get();
-        if probe {
-            self.ray_probe_increment(0, None);
-        }
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -251,9 +196,6 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
         let triangle = self.bvh_triangle(at, kind, &ray);
-        if probe {
-            self.ray_probe_triangle(at, [pointer, pointer_high.unwrap_or(zero)], &ray, triangle);
-        }
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
@@ -281,97 +223,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// One atomic add per active wave. The first wave to report a hit
-    /// elects its first active lane to record the six sample dwords.
-    fn ray_probe_increment(&mut self, word: u32, sample: Option<[V; 6]>) {
-        let yes = self.s.m.bool(true);
-        let count = self.s.op(
-            self.cur,
-            "waveAllOp",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            135,
-            &[yes],
-        );
-        let first = self.s.op(
-            self.cur,
-            "waveIsFirstLane",
-            Attr::NoUnwind,
-            self.s.t.i1,
-            110,
-            &[],
-        );
-        self.s.flags |= flags::WAVE_OPS;
-        let lane = self.begin_guarded(Some(first));
-        let storage = self.s.root_uav_handle(crate::emit::SLOT_FAULTS, crate::emit::rays());
-        let byte = self.s.m.i32(4 * (crate::emit::MEMORY_FAULTS + word));
-        let add = self.s.m.i32(0);
-        let undef = self.s.m.undef(self.s.t.i32);
-        let previous = self.s.op(
-            self.cur,
-            "atomicBinOp.i32",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            78,
-            &[storage, add, byte, undef, undef, count],
-        );
-        if let Some(fields) = sample {
-            let zero = self.s.m.i32(0);
-            let first = self.s.m.cmp(self.cur, pred::EQ, previous, zero);
-            let elected = self.begin_guarded(Some(first));
-            let mask = self.s.m.i8(1);
-            let align = self.s.m.i32(4);
-            for (i, field) in fields.into_iter().enumerate() {
-                let byte = self
-                    .s
-                    .m
-                    .i32(4 * (crate::emit::MEMORY_FAULTS + 2 + i as u32));
-                self.s.op(
-                    self.cur,
-                    "rawBufferStore.i32",
-                    Attr::NoUnwind,
-                    self.s.t.void,
-                    140,
-                    &[
-                        storage, byte, undef, field, undef, undef, undef, mask, align,
-                    ],
-                );
-            }
-            self.end_guarded(elected, &[]);
-        }
-        self.end_guarded(lane, &[]);
-    }
-
-    /// A geometric candidate exists before the guest chooses its closest
-    /// hit or applies material/alpha tests. Only one lane writes the sample.
-    fn ray_probe_triangle(&mut self, at: NodeAt, pointer: [V; 2], ray: &Ray, result: [V; 4]) {
-        let c = self.cur;
-        let numerator = self.as_float(result[0]);
-        let denominator = self.as_float(result[1]);
-        let distance = self.s.m.bin(c, Bin::SDiv, numerator, denominator);
-        let zero = self.s.m.f32(0);
-        let infinity = self.s.m.f32(f32::INFINITY.to_bits());
-        let forward = self.s.m.cmp(c, pred::OGE, distance, zero);
-        let finite = self.s.m.cmp(c, pred::OLT, distance, infinity);
-        let within = self.s.m.cmp(c, pred::OLE, distance, ray.extent);
-        let valid = self.s.m.bin(c, Bin::And, forward, finite);
-        let mut valid = self.s.m.bin(c, Bin::And, valid, within);
-        if let NodeAt::Memory { mapped, .. } = at {
-            valid = self.s.m.bin(c, Bin::And, valid, mapped);
-        }
-        let hit = self.begin_guarded(Some(valid));
-        let fields = [
-            pointer[0],
-            pointer[1],
-            self.as_int(distance),
-            self.as_int(ray.extent),
-            result[2],
-            result[3],
-        ];
-        self.ray_probe_increment(1, Some(fields));
-        self.end_guarded(hit, &[]);
-    }
-
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
@@ -384,6 +235,7 @@ impl<'a> Lower<'a> {
             // which is zeros.
             let c = self.cur;
             let slot = self.s.m.i32(slot);
+            let handle = self.s.heap_handle(c, slot, false, false, (11, 0));
             let (base_low, base_high) =
                 (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
             let at = self.s.m.bin(c, Bin::Sub, low, base_low);
@@ -392,21 +244,15 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (slot, at, inside);
+            return (handle, at, inside);
         }
-        self.memory_location(low, high, guard)
+        let (handle, byte) = self.memory(low, high, guard, false);
+        let mapped = self.page_there.expect("memory says");
+        (handle, byte, mapped)
     }
 
-    fn bvh_handle(&mut self, slot: V) -> V {
-        #[cfg(test)]
-        if TEST_MEMORY.get().is_some() {
-            return self.s.heap_handle(self.cur, slot, false, false, (11, 0));
-        }
-        self.memory_handle(slot)
-    }
-
-    /// The second 64-byte half of a Box32 node can belong to a different
-    /// guest page and a different host buffer.
+    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
+    /// their own maybe. Goes on in another block.
     fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
         match at {
             NodeAt::Buffer { handle, byte } => {
@@ -414,34 +260,24 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 NodeAt::Buffer { handle, byte }
             }
-            NodeAt::Memory { low, high, slot, byte, mapped, .. } => {
-                let c = self.cur;
-                let size = self.s.m.i32(64);
-                let next = self.s.m.bin(c, Bin::Add, byte, size);
-                let mask = self.s.m.i32(0xffff);
-                let end = self.s.m.i32(0xffc0);
-                let within = self.s.m.bin(c, Bin::And, low, mask);
-                let crosses = self.s.m.cmp(c, pred::EQ, within, end);
-                let gate = self.begin_guarded(Some(crosses));
-                let (next_low, next_high) = self.address_plus(low, high, 64);
-                let (tail_slot, tail_byte, tail_mapped) = self.bvh_memory(next_low, next_high, None);
-                let selected = self.end_guarded(gate, &[(tail_slot, slot), (tail_byte, next), (tail_mapped, mapped)]);
+            NodeAt::Memory { low, high, .. } => {
+                let (low, high) = self.address_plus(low, high, 64);
+                // Every lane in this block runs the instruction.
+                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
-                    handle: self.bvh_handle(selected[0]),
-                    byte: selected[1],
+                    handle,
+                    byte,
                     low,
                     high,
-                    mapped: selected[2],
-                    slot: selected[0],
+                    mapped,
                 }
             }
         }
     }
 
-    /// Reads within a single aligned 64-byte part of the node, in groups
-    /// of up to four dwords.
+    /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
+    /// (`base` computed, `offset` fixed), read four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let (handle, start_byte) = match at {
             NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
@@ -451,6 +287,7 @@ impl<'a> Lower<'a> {
             let n = (count - start).min(4);
             let node_byte = offset + 4 * start;
             let mut byte = start_byte;
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -512,8 +349,9 @@ impl<'a> Lower<'a> {
         let second = self.bvh_second_half(at);
         words.extend(self.bvh_node_words(second, None, 0, 12));
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        let wide_end = self.cur;
-        self.s.m.terminate(wide_end, Term::Br(join));
+        // (The look for the second half goes on in another block.)
+        let wide_block = self.cur;
+        self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -537,16 +375,16 @@ impl<'a> Lower<'a> {
         }
         self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
-        // All child IDs are in the first part. The last two Box32 bounds
-        // also require the second. A zero returned by a missing page is a
-        // valid child pointer or coordinate, so the slab test alone cannot
-        // distinguish it from real geometry.
-        let residency = match (at, second) {
+        // A page that is not there reads zeros, which are a child and a box:
+        // no child of it is hit. (The last two boxes of a 128-byte node are in
+        // its second half.)
+        let there = match (at, second) {
             (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
-                let mapped = self.s.m.phi(join, self.s.m.type_of(first));
+                let i1t = self.s.m.type_of(first);
+                let mapped = self.s.m.phi(join, i1t);
                 self.s
                     .m
-                    .set_phi(mapped, vec![(last, wide_end), (first, half_block)]);
+                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
                 let both = self.s.m.bin(join, Bin::And, first, mapped);
                 Some([first, first, both, both])
             }
@@ -557,7 +395,7 @@ impl<'a> Lower<'a> {
             let phi = self.s.m.phi(join, f32t);
             self.s
                 .m
-                .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
+                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).
@@ -601,10 +439,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
-            let child_present = self.s.m.cmp(c, pred::NE, children[n], none);
-            let hit = self.s.m.bin(c, Bin::And, hit, child_present);
-            let hit = match residency {
-                Some(pages) => self.s.m.bin(c, Bin::And, hit, pages[n]),
+            let child = self.s.m.cmp(c, pred::NE, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, child);
+            let hit = match there {
+                Some(there) => self.s.m.bin(c, Bin::And, hit, there[n]),
                 None => hit,
             };
             ids[n] = self.s.m.select(c, hit, children[n], none);

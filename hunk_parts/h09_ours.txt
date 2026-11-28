@@ -1,0 +1,6 @@
+        self.spans
+            .range((start, 0)..(start.saturating_add(1), 0))
+            .flat_map(|(_, slots)| slots.1.iter())
+            .filter_map(|slot| self.first.get(slot))
+            .min()
+            .copied()

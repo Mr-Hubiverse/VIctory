@@ -1,0 +1,8 @@
+    /// memory (the list's own, which it holds).
+    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.keep(index, None);
+        self.set_stride(index, 0);
+        let Some(host) = host() else { return };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_view_size(size),

@@ -1,0 +1,5 @@
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        // Uploaded before: out of the queue (whole uploads being looked at
+        // again are in `rechecks`, so not here), or in it after a part
+        // upload.
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0));

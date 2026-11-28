@@ -1,0 +1,19 @@
+        let marks = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer. Every
+                // slot starts as marking nothing.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0xFF, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view write marks by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
+        let stride_table = (!sampler)
+            .then(|| StrideTable::new(&host.device, size))
+            .flatten();
+        let mut h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),

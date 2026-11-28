@@ -1,0 +1,127 @@
+/// Dynamic slots of a view heap capped at [`PORTABLE_VIEWS`] minus the slots
+/// memory by address takes.
+const DYNAMIC_CAPPED: u32 = 1 << 16;
+
+/// The most descriptors a shader-visible sampler heap holds.
+const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+
+/// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
+/// reaching past the cap.
+const SAMPLER_DYNAMIC: u32 = 256;
+
+#[allow(dead_code)]
+/// Diagnostics of [`HostHeap::bindless_plan`]: per part (the direct slots'
+/// check, the list of all slots, the look for stale views, the slots made,
+/// their results applied, the whole plan built again), the microseconds,
+/// the times it ran, the items it walked and those it found, summed and
+/// logged every 64 presented frames.
+static PLAN_NOTES: [[AtomicU64; 4]; 9] = [const { [const { AtomicU64::new(0) }; 4] }; 9];
+#[allow(dead_code)]
+static PLAN_FRAME: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)]
+/// Slots the plan lacked something for, by what: bit 0 another write, bit 1
+/// another bounce, bit 2 a read outside the plan.
+static LACKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[allow(dead_code)]
+/// Frames with such a slot, and with one lacking more than a bounce: the
+/// last frame counted, the count.
+static LACK_FRAMES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+
+#[allow(dead_code)]
+/// Whether the plan's unchanged part is kept from frame to frame
+/// (`VICTORY_PLAN_REUSE=0`: as before, for comparison).
+fn reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLAN_REUSE").is_none_or(|v| v != "0"))
+}
+
+#[allow(dead_code)]
+/// A plan built some frames ago may read memory no slot views any more:
+/// for at most this many frames.
+///
+/// shortcut: the plan is built again at once only for a slot that brings
+/// what it lacks (memory to read outside its ranges, another range to
+/// write, another bounce). One that only stops reading leaves its range in
+/// the plan, refreshed for nothing, until the next build: of 70,000 slots
+/// some hundred come out otherwise each frame, and building the plan for
+/// them took 10 to 14 ms a frame (run fps1).
+const LOOSE_FRAMES: u64 = 8;
+
+#[allow(dead_code)]
+type Range = Option<(Arc<crate::shadow::Shadow>, usize, usize)>;
+
+#[allow(dead_code)]
+fn same_range(x: &Range, y: &Range) -> bool {
+    match (x, y) {
+        (None, None) => true,
+        (Some((s, a, l)), Some((t, b, m))) => Arc::ptr_eq(s, t) && (a, l) == (b, m),
+        _ => false,
+    }
+}
+
+#[allow(dead_code)]
+/// Whether `range` lies in one of `merged` (as [`merged`] leaves them).
+fn covered(merged: &[(Arc<crate::shadow::Shadow>, usize, usize)], range: &Range) -> bool {
+    let Some((shadow, address, len)) = range else { return true };
+    let key = (Arc::as_ptr(shadow) as usize, *address);
+    let after = merged.partition_point(|(s, a, _)| (Arc::as_ptr(s) as usize, *a) <= key);
+    after > 0 && {
+        let (s, a, l) = &merged[after - 1];
+        Arc::ptr_eq(s, shadow) && address + len <= a + l
+    }
+}
+
+#[allow(dead_code)]
+/// Whether two uses of a slot put the same things in a plan.
+fn same_ranges(a: &SlotUse, b: &SlotUse) -> bool {
+    use windows::core::Interface;
+    let same = same_range;
+    same(&a.read, &b.read)
+        && same(&a.write, &b.write)
+        && a.bounce == b.bounce
+        && a.retained.as_ref().map(Interface::as_raw) == b.retained.as_ref().map(Interface::as_raw)
+}
+
+#[allow(dead_code)]
+fn plan_note(part: usize, started: std::time::Instant, walked: usize, found: usize) {
+    let n = &PLAN_NOTES[part];
+    n[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    n[1].fetch_add(1, Ordering::Relaxed);
+    n[2].fetch_add(walked as u64, Ordering::Relaxed);
+    n[3].fetch_add(found as u64, Ordering::Relaxed);
+    let frame = crate::queue::presented();
+    let last = PLAN_FRAME.load(Ordering::Relaxed);
+    if frame >= last + 64
+        && PLAN_FRAME.compare_exchange(last, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        let frames = (frame - last).max(1) as f64;
+        const NAMES: [&str; 9] = ["direct slots", "all slots listed", "stale views", "slots made", "results applied", "whole plan", "differing (found: lacking)", "lacking a write (found: a bounce)", "lacking a read (found: gone with a write or bounce)"];
+        let mut text = String::new();
+        for (name, n) in NAMES.iter().zip(&PLAN_NOTES) {
+            let [us, runs, walked, found] = [0, 1, 2, 3].map(|k| n[k].swap(0, Ordering::Relaxed));
+            text.push_str(&format!(
+                "; {name}: {:.2} ms, {:.1} runs, {:.0} walked, {:.1} found",
+                us as f64 / 1e3 / frames,
+                runs as f64 / frames,
+                walked as f64 / frames,
+                found as f64 / frames
+            ));
+        }
+        let lacks = LACKS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        let [any, more] = LACK_FRAMES.each_ref().map(|n| n[1].swap(0, Ordering::Relaxed));
+        text.push_str(&format!(
+            "; slots lacking per frame, by write+bounce*2+read*4: {:.1?}; of {frames:.0} frames,              {any} had a lacking slot and {more} one lacking more than a bounce",
+            &lacks[1..]
+        ));
+        tracing::info!("bindless plan per frame{text}");
+    }
+}
+
+/// The descriptor count a view heap of `count` title slots is made with:
+/// room for the views of memory by address follows the title's.
+fn view_slots(count: u32) -> u32 {
+    count + crate::memory::SLOTS
+}
+
+const NULL_BLOCK: u32 = 1 << 16;
+

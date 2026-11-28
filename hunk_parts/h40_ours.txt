@@ -1,0 +1,13 @@
+    pub(crate) fn set_texture_pressure(&self, full: bool) {
+        self.texture_pressure
+            .store(full, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
+    /// returned), if they were taken by this heap: `id` is [`HostHeap::id`]'s.
+    /// The title can release the heap a list's slots came from, and a later
+    /// heap can be made at the same address; the list's reset then names the
+    /// old heap, and must not free the new one's slots ([NEXT_ID]).
+    ///
+    /// [`dynamic`]: HostHeap::dynamic
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32, discarded: bool) {

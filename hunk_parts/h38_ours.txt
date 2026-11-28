@@ -1,0 +1,9 @@
+            let span = placed_view
+                .and_then(|(resource, start, first)| Some((resource, start, start.saturating_add(placed.bytes(resource, first)?), first)));
+            match span {
+                Some((resource, start, end, first)) => {
+                    SPANNED[0].fetch_min(start, Relaxed);
+                    SPANNED[1].fetch_max(end, Relaxed);
+                    let stale = placed.note(index, start, end, resource, !seen && stale_out());
+                    placed.shows(index, first);
+                    stale

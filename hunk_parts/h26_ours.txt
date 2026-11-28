@@ -1,0 +1,3 @@
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64, bool)>, [u64; 5]) {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))

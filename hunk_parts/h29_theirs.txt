@@ -1,0 +1,23 @@
+    /// Makes the slots of the textures filled with less than was mapped
+    /// ([`read_short`]) due from the next frame on. Returns how many.
+    pub(crate) fn texture_slots_short(&self, frame: u64) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        let starts = std::mem::take(&mut SHORT.lock().unwrap_or_else(|e| e.into_inner()).0);
+        if starts.is_empty() {
+            return 0;
+        }
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
+        for &slot in &slots {
+            textures.changed(slot, frame, frame + 1);
+        }
+        slots.len()
+    }

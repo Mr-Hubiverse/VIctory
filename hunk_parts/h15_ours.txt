@@ -1,0 +1,363 @@
+// SAFETY: D3D12 descriptor heaps and resources are free-threaded; mutable
+// slot tracking is synchronized behind mutexes and atomics.
+unsafe impl Send for HostHeap {}
+// SAFETY: as above.
+unsafe impl Sync for HostHeap {}
+
+#[allow(dead_code)]
+const BOUNCE_CHUNK: u64 = 256 << 10;
+
+/// Persistent 256-byte-aligned bounce slice for a misaligned bindless CBV.
+struct BounceSlot {
+    #[allow(dead_code)]
+    gpu: u64,
+    cpu: usize,
+    cap: u32,
+    resource: ID3D12Resource,
+    active: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct Bindless {
+    #[allow(dead_code)]
+    /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
+    slots: BTreeMap<u32, (u32, u32)>,
+    /// Of them, those viewing placed textures.
+    placed_set: BTreeMap<u32, (u32, u32)>,
+    /// Placed-texture slots changed since draws last prepared them.
+    record_pending: BTreeSet<u32>,
+    /// Persistent 256-byte-aligned bounce slices by `slot_index`.
+    cbv_bounce: HashMap<u32, BounceSlot>,
+    /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
+    bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
+    /// Slots written since the plan was made: only they are made again.
+    dirty: BTreeSet<u32>,
+    /// Slots of `dirty` in the order the title wrote them (some may be made
+    /// since): the last ones are the tables of the work being submitted.
+    recent: Vec<u32>,
+    /// What each slot made for bindless access needs at submission.
+    uses: BTreeMap<u32, SlotUse>,
+    /// Of them, those with work at each submission.
+    busy: BTreeSet<u32>,
+    /// Subset of `uses` currently marked unmapped (checked on memory remap).
+    unmapped_slots: std::collections::HashSet<u32>,
+    /// Subset of `uses` holding a direct-memory window (checked for `is_dead`).
+    direct_slots: std::collections::HashSet<u32>,
+    /// The count of windows that died ([`crate::shadow::died`]) the direct
+    /// slots were last looked at with.
+    died_seen: u64,
+    /// Slots came out otherwise since the whole plan was last built, with
+    /// nothing the plan lacks ([`LOOSE_FRAMES`]).
+    loose: bool,
+    /// The host resources those slots view, held by the plans until then.
+    extra: Vec<ID3D12Resource>,
+    /// The released-view, placed-texture, and memory-remap epochs `uses` was checked at.
+    checked: (u64, u64, u64),
+    /// What submissions do for the slots, until they or what they view change.
+    plan: Option<Arc<BindlessPlan>>,
+    /// Placed-texture slots as last prepared at recording: view key,
+    /// texture.
+    recorded: HashMap<u32, (u64, usize)>,
+    #[allow(dead_code)]
+    /// Placed textures reached through slots, by resource object: the host
+    /// texture (held, so its address names it alone) and the frame last
+    /// uploaded.
+    uploaded: HashMap<usize, (ID3D12Resource, u64)>,
+    /// Uploaded textures by frame, oldest first, to look at again.
+    recheck: VecDeque<(u64, usize)>,
+    /// A frame and the uploads of known textures done in it.
+    rechecks: (u64, u32),
+    /// When the slot-making budget was last refilled, and the microseconds
+    /// left: plans at submission, placed textures at recording.
+    budget: Option<(std::time::Instant, [u64; 2])>,
+    /// The frame (plus one) released views and evicted textures were last
+    /// looked for in: at submission, at recording. Once per frame: the title
+    /// releases and evicts all the time, and each look is over all slots.
+    looked: [u64; 2],
+    /// The ranges of [`MAPPED`] seen.
+    mapped_seen: u64,
+    /// The frame (plus one) the plan's lists of everything were last made in,
+    /// and whether slots changed since.
+    full: (u64, bool),
+}
+
+#[allow(dead_code)]
+/// Time for making changed slots, at submission and at recording: an eighth
+/// of the time passing (4 ms of a 30 fps frame), banked up to this many
+/// microseconds; what is left over waits.
+///
+/// shortcut: while the title streams thousands of slots in at once, the
+/// slots not made yet read nothing (null views) for a few frames, as
+/// streaming pops in; making all of them at once stalled frames for
+/// seconds.
+const SLOT_BUDGET_US: u64 = 20_000;
+#[allow(dead_code)]
+/// Slots taken to make at once (the rest wait without being looked at).
+const SLOT_CHUNK: usize = 512;
+#[allow(dead_code)]
+/// Slots made at each submission whatever time they take.
+const URGENT: usize = 2048;
+
+impl Bindless {
+    #[allow(dead_code)]
+    /// The slot-making budget, refilled for the time passed since.
+    fn budget(&mut self) -> &mut [u64; 2] {
+        let now = std::time::Instant::now();
+        let (at, left) = self
+            .budget
+            .get_or_insert((now, [SLOT_BUDGET_US; 2]));
+        let add = now.duration_since(*at).as_micros() as u64 / 8;
+        if add > 0 {
+            *at = now;
+            for l in left.iter_mut() {
+                *l = (*l + add).min(SLOT_BUDGET_US);
+            }
+        }
+        left
+    }
+}
+
+#[allow(dead_code)]
+/// Slots waiting to be made: at submission, at recording (for the log).
+pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// What one bindless slot needs at submission.
+#[derive(Default)]
+struct SlotUse {
+    #[allow(dead_code)]
+    /// Title memory it reads (host copy, address, bytes).
+    read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// What shaders may write through it.
+    write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// A misaligned constant buffer: bounce slice, title address, bytes.
+    bounce: Option<(usize, u64, u32)>,
+    /// The host resource it views.
+    retained: Option<ID3D12Resource>,
+    /// The title memory it views in place.
+    direct: Option<Arc<crate::shadow::Shadow>>,
+    /// It views a placed texture: the texture's object (0 for none), made
+    /// again when the texture is evicted.
+    placed: Option<usize>,
+    /// It views unmapped memory (looked at again when memory is remapped),
+    /// this of it.
+    unmapped: bool,
+    at: (u64, u64),
+}
+
+#[allow(dead_code)]
+/// Placed textures reached only through bindless slots are uploaded when a
+/// slot first reaches them, and then looked at again (their memory hashed)
+/// at most this often, in frames, ...
+///
+/// shortcut: a texture the title rewrites in place without writing a slot
+/// shows its new contents up to this many frames late through bindless
+/// access (tables still upload what their draws read). Hashing all of them
+/// at each submission cost seconds per frame while the world streams in.
+const RECHECK_FRAMES: u64 = 15;
+#[allow(dead_code)]
+/// ... and at most this many of them per frame.
+const RECHECKS: u32 = 32;
+
+/// Bumped when views go stale (a resource was released): their views'
+/// generations are checked, all at once, at the next submission.
+static VIEWED: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped when title memory is mapped or unmapped: only unmapped and direct
+/// bindless slots need checking (no full `stale_views` scan over all slots).
+static MEMORY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory mapped or unmapped lately (start, end), and how many were.
+static MAPPED: Mutex<(VecDeque<(u64, u64)>, u64)> = Mutex::new((VecDeque::new(), 0));
+/// Of them, those kept; a heap that missed some looks at all its slots.
+const MAPPED_KEPT: usize = 1 << 16;
+
+/// Title memory `[start, end)` was mapped or unmapped.
+pub(crate) fn bindless_memory_changed(start: u64, end: u64) {
+    {
+        let mut m = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        if m.0.len() == MAPPED_KEPT {
+            m.0.pop_front();
+        }
+        m.0.push_back((start, end));
+        m.1 += 1;
+    }
+    MEMORY_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+#[allow(dead_code)]
+/// The ranges mapped or unmapped since the first `seen`, sorted and merged
+/// (`None` if they are not all known), and how many there were.
+fn mapped_since(seen: u64) -> (Option<Vec<(u64, u64)>>, u64) {
+    let m = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = (m.1 - seen) as usize;
+    if n > m.0.len() {
+        return (None, m.1);
+    }
+    let mut ranges: Vec<(u64, u64)> = m.0.iter().skip(m.0.len() - n).copied().collect();
+    let count = m.1;
+    drop(m);
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    (Some(out), count)
+}
+
+#[allow(dead_code)]
+/// Whether `[start, end)` meets one of `ranges` (sorted, merged).
+fn meets(ranges: &[(u64, u64)], (start, end): (u64, u64)) -> bool {
+    let i = ranges.partition_point(|r| r.1 <= start);
+    ranges.get(i).is_some_and(|r| r.0 < end)
+}
+
+/// Bindless slots must be checked again: a resource their views name was
+/// released, or title memory was mapped or unmapped.
+pub(crate) fn bindless_viewed_changed() {
+    VIEWED.fetch_add(1, Ordering::Release);
+}
+
+#[allow(dead_code)]
+/// Bindless unordered access ranges larger than this are not copied back.
+///
+/// shortcut: copy-back finds what shaders wrote by keeping a range's bytes
+/// before each submission; a bindless slot viewing a title's big shared heap
+/// would cost a copy and a compare of all of it per submission whether or
+/// not a shader writes there. Such ranges stay on the GPU's side.
+const WRITE_CAP: usize = 8 << 20;
+
+#[allow(dead_code)]
+/// Gap below which two ranges of one host copy are refreshed as one: the
+/// write-watch answers by 64 KiB page, and fewer, larger askings cost less.
+const READ_GAP: usize = 64 << 10;
+
+/// What a submission does for a heap's bindless slots, made again only when
+/// the slots or what they view change ([`HostHeap::bindless_plan`]).
+pub(crate) struct BindlessPlan {
+    #[allow(dead_code)]
+    /// Title memory the slots read, merged per host copy (address, bytes):
+    /// refreshed at each submission using the heap.
+    pub(crate) reads: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
+    /// copied back after a submission whose shaders may write memory.
+    pub(crate) writes: Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// Misaligned constant buffers: bounce slice, title address, bytes.
+    bounces: Arc<Vec<(usize, u64, u32)>>,
+    #[allow(dead_code)]
+    /// Of them, those new in this plan.
+    fresh: Vec<(usize, u64, u32)>,
+    fresh_reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The frame (plus one) the bounces were last copied in.
+    copied_in: AtomicU64,
+    /// The host resources the slots view, held while a submission runs.
+    _retained: Arc<Vec<ID3D12Resource>>,
+    /// Those of slots made since `_retained` was listed.
+    _extra: Vec<ID3D12Resource>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the rest is plain data.
+unsafe impl Send for BindlessPlan {}
+// SAFETY: as above.
+unsafe impl Sync for BindlessPlan {}
+
+impl BindlessPlan {
+    #[allow(dead_code)]
+    /// Copies the misaligned constant buffers into their bounce slices.
+    ///
+    /// shortcut: all of them once a frame, else only for a plan not copied
+    /// yet: the title writes constants before it points a slot at them.
+    /// Returns the title memory to bring up to date, by the same rule.
+    /// And whether it is all of it (and may be looked at less often where it
+    /// does not change) rather than what is new.
+    pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
+        let frame = crate::queue::presented() + 1;
+        // Counted for all plans: each is the one before with a few changes.
+        static FRAME: AtomicU64 = AtomicU64::new(0);
+        let all = FRAME.swap(frame, Ordering::AcqRel) != frame;
+        let fresh = self.copied_in.swap(frame, Ordering::AcqRel) == 0;
+        let (bounces, reads) = match (all || cfg!(test), fresh) {
+            (true, _) => (&*self.bounces, &*self.reads),
+            (_, true) => (&self.fresh, &self.fresh_reads),
+            _ => return (&[], false),
+        };
+        if !bounces.is_empty() {
+            let started = std::time::Instant::now();
+            let bytes: u64 = bounces.iter().map(|b| u64::from(b.2)).sum();
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Copies, bounces.len() as u64);
+                add(C::CopyBytes, bytes);
+            }
+            crate::host::in_parallel(bounces, 1024, copy_bounces);
+            let us = started.elapsed().as_micros() as u64;
+            crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            crate::host::PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+        }
+        (reads, all)
+    }
+}
+
+#[allow(dead_code)]
+/// Copies constant buffers (destination, title address, bytes), those near
+/// each other in title memory (as sorted lists have them) read at once.
+fn copy_bounces(list: &[(usize, u64, u32)]) {
+    const GAP: u64 = 4 << 10;
+    const RUN: u64 = 128 << 10;
+    let mut scratch = vec![0u8; RUN as usize];
+    let mut rest = list;
+    while let Some(&(_, first, len)) = rest.first() {
+        let mut end = first + u64::from(len);
+        let mut n = 1;
+        for &(_, a, l) in &rest[1..] {
+            let to = end.max(a + u64::from(l));
+            if a < first || a > end + GAP || to - first > RUN {
+                break;
+            }
+            end = to;
+            n += 1;
+        }
+        let (run, after) = rest.split_at(n);
+        rest = after;
+        let whole = (end - first) as usize;
+        let read = n > 1
+            && whole <= scratch.len()
+            && crate::host::read_into(first as *const u8, &mut scratch[..whole]);
+        for &(cpu, a, l) in run {
+            if read {
+                let from = &scratch[(a - first) as usize..][..l as usize];
+                // SAFETY: a bounce slice of at least `l` bytes, ours.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(from.as_ptr(), cpu as *mut u8, l as usize);
+                }
+            } else {
+                crate::host::copy_mapped(cpu as *mut u8, a as *const u8, l as usize, false);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+/// `ranges` (host copy, address, bytes) sorted and merged per host copy
+/// where they overlap or lie within `gap` of each other.
+fn merged(
+    mut ranges: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    gap: usize,
+) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
+    ranges.sort_unstable_by_key(|(s, a, _)| (Arc::as_ptr(s) as usize, *a));
+    let mut out: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for (shadow, address, len) in ranges {
+        if let Some((s, a, l)) = out.last_mut()
+            && Arc::ptr_eq(s, &shadow)
+            && address <= *a + *l + gap
+        {
+            *l = (*l).max(address + len - *a);
+            continue;
+        }
+        out.push((shadow, address, len));
+    }
+    out

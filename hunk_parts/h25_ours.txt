@@ -1,0 +1,1 @@
+        *next = ((first + n) % taken.len()) as u32;

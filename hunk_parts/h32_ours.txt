@@ -1,0 +1,7 @@
+        if restored != 0 {
+            static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let before = TOTAL.fetch_add(restored, std::sync::atomic::Ordering::Relaxed);
+            let total = before + restored;
+            if before == 0 || total / 256 != before / 256 {
+                tracing::info!(frame, restored, total, "requeued displaced texture views after their aliases expired");
+            }

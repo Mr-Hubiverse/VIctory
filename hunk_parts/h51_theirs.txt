@@ -1,0 +1,3 @@
+    pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
+        let textures = self.queue(super::queue_site::OTHER);
+        match textures.slots.get(&index) {

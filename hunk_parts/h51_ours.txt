@@ -1,0 +1,12 @@
+    pub(crate) fn texture_slot_state(&self, index: u32, frame: u64, view: Option<&View>) -> String {
+        let residency = if let Some(View::Placed(false, resource, desc)) = view && resource[0] != 1 {
+            let start = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
+            let first = crate::resource::first_mip(desc);
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let bytes = placed.bytes(resource, first).unwrap_or(0);
+            let (claim, overlap) = placed.claim(index, start, start.saturating_add(bytes), resource);
+            let mapped = crate::texture::mapped_bytes(start as *const u8, bytes as usize);
+            format!(" mip={first} visible={mapped}/{bytes} claim={claim:?} overlap={overlap:x?}")
+        } else { String::new() };
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let state = match textures.slots.get(&index) {

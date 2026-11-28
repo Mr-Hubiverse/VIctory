@@ -1,0 +1,18 @@
+#[allow(dead_code)]
+impl HostHeap {
+    #[allow(dead_code)]
+    /// The microseconds of slot making (`which`: 0 plans, 1 recording) left.
+    fn budget_left(&self, which: usize) -> u64 {
+        self.bindless
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget()[which]
+    }
+
+    /// Notes `us` microseconds of slot making spent.
+    fn budget_spend(&self, which: usize, us: u64) {
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        let left = &mut b.budget()[which];
+        *left = left.saturating_sub(us);
+    }
+

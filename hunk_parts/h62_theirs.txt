@@ -1,0 +1,3 @@
+    let texture = crate::resource::texture_at(address, resource)?;
+    crate::resource::want_level(texture, crate::resource::first_mip(desc));
+    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))

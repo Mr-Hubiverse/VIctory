@@ -1,0 +1,12 @@
+            #[cfg(feature = "diagnostics")]
+            let keeping = std::time::Instant::now();
+            self.keep(index, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            if mirror_timing() {
+                use std::sync::atomic::Ordering::Relaxed;
+                MIRROR_US[1].fetch_add((keeping - creating).as_micros() as u64, Relaxed);
+                MIRROR_US[2].fetch_add(keeping.elapsed().as_micros() as u64, Relaxed);
+            }
+            // After the slot is made and kept: a reader without the lock
+            // takes the record as made only once it is.
+            self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);

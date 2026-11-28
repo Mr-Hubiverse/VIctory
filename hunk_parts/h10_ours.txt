@@ -1,0 +1,2 @@
+            .chain(self.spans.range((start, 0)..(end, 0)))
+            .flat_map(|(_, slots)| slots.1.iter().copied())

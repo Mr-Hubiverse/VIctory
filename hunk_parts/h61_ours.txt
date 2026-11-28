@@ -1,0 +1,2 @@
+            resource[0] != 1 && desc[10..12] == other_desc[10..12]
+                && crate::resource::placed_key(*resource) == crate::resource::placed_key(*other)

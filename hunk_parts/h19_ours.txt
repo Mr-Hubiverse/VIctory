@@ -1,0 +1,2 @@
+        let wanted = count;
+        let (heap, count, extra, size) = if null == 0 {

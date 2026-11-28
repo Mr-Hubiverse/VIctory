@@ -1,0 +1,61 @@
+    #[cfg(test)]
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
+        (if max == 0 { Vec::new() } else { due.order(max) }, census)
+    }
+
+    /// Up to `max` title slots whose texture view is due at `frame`, each
+    /// with its write number, in the order to serve them
+    /// ([`TextureQueue::due`]); beside each slot what
+    /// [`TextureQueue::checked`] said of it then, read in the same take of
+    /// the lock (the pass asked it slot by slot, under the lock each time);
+    /// and the queue's counts ([`TextureQueue::census`]).
+    pub(crate) fn texture_slots_due_known(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>, [u64; 6]) {
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
+        let (order, known) = if max == 0 { (Vec::new(), Vec::new()) } else { due.ordered(max) };
+        (order, known, census)
+    }
+
+    /// The write of the entry the queue holds for title slot `index`, by its
+    /// marks (0: none; [`QueueMarks`]); `None`: not known so (ask the queue).
+    pub(crate) fn texture_slot_write(&self, index: u32) -> Option<u64> {
+        if !queue_marks() {
+            return None;
+        }
+        self.marks.get(index)
+    }
+
+    /// What the pass found of slots it took, each with the write it was
+    /// handed and the frame it was found in, told under one take of the
+    /// lock, as [`HostHeap::texture_slot_done`], `_recheck`, `_later` and
+    /// `_held` tell it one at a time. Leaves `told` empty.
+    pub(crate) fn texture_slots_told(&self, told: &mut Vec<(u32, u64, u64, Told)>) {
+        if told.is_empty() {
+            return;
+        }
+        let mut textures = self.queue(super::queue_site::TELL);
+        for (index, write, frame, what) in told.drain(..) {
+            match what {
+                Told::Done(again) => {
+                    textures.note_served(index, write, frame);
+                    match again {
+                        Some((due, mapped)) => textures.partly(index, write, due, mapped),
+                        None => textures.done(index, write),
+                    }
+                }
+                Told::Recheck(due, at, print, looks, uploaded) => {
+                    textures.note_served(index, write, frame);
+                    textures.recheck(index, write, due, at, print, looks, uploaded);
+                }
+                Told::Later(at, most) => textures.later(index, write, at, most),
+                Told::Held(due) => textures.hold(index, write, due),
+            }
+        }
+    }
+
+    /// A number that changes when a slot is written or made due anew, and
+    /// whether memory was noted since a pass last took the notes.
+    pub(crate) fn texture_news(&self) -> (u64, bool) {
+        let writes = self.queue(super::queue_site::OTHER).writes;
+        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))

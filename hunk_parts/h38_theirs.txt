@@ -1,0 +1,14 @@
+            let span = placed_view.and_then(|(resource, start, first, held)| {
+                Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
+            });
+            match span {
+                Some((start, end, first, held)) => {
+                    SPANNED[0].fetch_min(start, Relaxed);
+                    SPANNED[1].fetch_max(end, Relaxed);
+                    placed.rule = stale_rule();
+                    self.spanned.put(index);
+                    let stale = placed.note(index, start, end, !seen);
+                    placed.shows(index, first, held);
+                    // (Under the lock of `placed`: a later write of one of
+                    // them comes by here before it makes the slot.)
+                    stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()

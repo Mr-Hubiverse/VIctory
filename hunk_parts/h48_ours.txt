@@ -1,0 +1,20 @@
+                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                mirror_how(MIRROR_KEPT);
+                // The slot goes on showing what it was made from.
+                self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
+                    if !self.sampler {
+                if view.is_buffer() {
+                    let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
+                    self.track_bindless(index, (i, generation), placed);
+                } else {
+                    self.untrack_bindless(index);
+                }
+            }
+                return Ok(Some(view));
+            }
+            made[index as usize] = if later { 0 } else { key };
+            #[cfg(feature = "diagnostics")]
+            mirror_how(if later { MIRROR_LATER } else { MIRROR_MADE });
+            #[cfg(feature = "diagnostics")]
+            let creating = std::time::Instant::now();

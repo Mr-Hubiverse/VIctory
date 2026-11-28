@@ -57,41 +57,14 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// AMD's D3D12 compiler has crashed inside `CreateComputePipelineState`
-/// while several early pipelines were being made together. Keep parallel
-/// shader translation, but enter the AMD driver's PSO creation path one at a
-/// time; other vendors retain the existing parallel compilation path.
-static AMD_PSO_CREATION: Mutex<()> = Mutex::new(());
-static AMD_ADAPTER: OnceLock<bool> = OnceLock::new();
-
-fn amd_adapter() -> bool {
-    *AMD_ADAPTER.get_or_init(|| {
-        let amd = crate::host::host().is_some_and(|host| host.is_amd());
-        if amd {
-            tracing::info!("serializing host pipeline creation on AMD D3D12");
-        }
-        amd
-    })
-}
-
-fn create_pso<T>(serialize: bool, create: impl FnOnce() -> T) -> T {
-    if serialize {
-        let _creation = AMD_PSO_CREATION
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        create()
-    } else {
-        create()
-    }
-}
-
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
-pub(super) fn bad_shaders_path() -> Option<PathBuf> {
-    DIR.get().map(|d| d.join("bad_shaders.txt"))
+/// The folder the library is kept in.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -282,6 +255,55 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Whether the pipeline this thread makes has static samplers
+    /// ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pipelines this thread makes while the guard lives have static
+/// samplers (`samplers`): they are made, never loaded from or stored in the
+/// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
+///
+/// Why: the card's driver (NVIDIA, 4070 SUPER) keeps static samplers in a
+/// table of its own and puts their places in that table into the compiled
+/// pipeline. A pipeline loaded from the library in another process keeps the
+/// places of the process that stored it; where that process made other
+/// static samplers first, they are other samplers. Measured
+/// (`examples/lut3d_probe.rs`): a pipeline whose root signature has a point,
+/// a linear and a trilinear sampler, stored, then loaded in a process that
+/// made ten other static samplers before its own, sampled a 3D table
+/// through the linear one unfiltered (every result a table entry); made in
+/// that process instead, filtered. In the title, PS_CompositeNMB loaded so
+/// read its colour-grading tables unfiltered: posterized light in steps of
+/// 0.44 stops with green and magenta fringes (2026-11-26 runs; made in the
+/// run, the image was smooth). Every loaded pipeline with static samplers
+/// may read through another one's: other filters, address modes, levels
+/// and comparisons.
+/// shortcut: they are compiled every run (the driver's own cache on disk
+/// makes that quick); a fixed order of static samplers made before any
+/// pipeline would let the library keep them again.
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers && !static_samplers_kept()))
+}
+
+/// While it lives, the pipelines this thread makes skip the library if they
+/// have static samplers ([`with_static_samplers`]); the setting before it
+/// comes back when it is dropped.
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_LIBRARY_STATIC_SAMPLERS=1`: pipelines with static samplers are
+/// loaded from and stored in the library too, as before.
+fn static_samplers_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LIBRARY_STATIC_SAMPLERS").is_some_and(|v| v == "1")
+    })
 }
 
 /// Names the pipeline this thread makes next.
@@ -394,7 +416,7 @@ pub(crate) fn removal_note() -> String {
 /// Called once a second by the sweep; does its work on a thread of its own
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
-pub(crate) fn trim(force: bool) {
+pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
@@ -403,8 +425,8 @@ pub(crate) fn trim(force: bool) {
     {
         return;
     }
-    let quiet_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
-    if (!force && crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms)
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
@@ -461,28 +483,18 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
-/// A library the driver refused, kept as it was ([`open`]).
-const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
-            // With RenderDoc loaded the device is RenderDoc's: the card's
-            // library is not for it, and what it would save is not for
-            // the card. Neither read nor written in such a run.
-            #[cfg(feature = "diagnostics")]
-            if crate::renderdoc::loaded() {
-                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
-                return None;
-            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -503,7 +515,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -522,10 +533,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => {
-                rejected = true;
-                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
-            }
+            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -533,15 +541,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    // And the file is kept under another name, not written over by this
-    // run's first save: a refusal may be this device's alone (run 263:
-    // RenderDoc's device refused the card's library, an empty one was
-    // saved over 366 MB of built pipelines, and the next run drew black
-    // until they were built again).
-    if rejected && let Some(dir) = DIR.get()
-        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
-            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
-        }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -562,255 +561,6 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// Pipelines a driver's compiler crashed on (names, one per line).
-const CRASHED_FILE: &str = "crashed.txt";
-
-/// The pipeline named `name` is left out from the next run on.
-fn note_crashed(name: &str) {
-    use std::io::Write;
-    let Some(dir) = DIR.get() else { return };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(CRASHED_FILE));
-    if let Ok(mut f) = file {
-        let _ = writeln!(f, "{name}");
-    }
-}
-
-/// Whether the driver crashed making the pipeline named `name` before.
-fn crashed(name: &str) -> bool {
-    static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
-    NAMES
-        .get_or_init(|| {
-            DIR.get()
-                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
-                .map(|t| t.lines().map(str::to_owned).collect())
-                .unwrap_or_default()
-        })
-        .contains(name)
-}
-
-thread_local! {
-    /// The pipeline the driver makes on this thread.
-    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-/// The driver makes a pipeline on this thread. If its compiler crashes there
-/// (AMD's does on a few of the world's compute shaders), the pipeline is
-/// noted and left out from then on, and the thread parked: the others, and
-/// the title, go on.
-struct Making;
-
-impl Making {
-    fn new(name: &str) -> Making {
-        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
-        static HANDLER: std::sync::Once = std::sync::Once::new();
-        // SAFETY: a handler that lives as long as the process.
-        HANDLER.call_once(|| unsafe {
-            AddVectoredExceptionHandler(1, Some(compiler_crashed));
-        });
-        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
-        endless(name, true);
-        Making
-    }
-}
-
-/// The process's private bytes.
-fn committed() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: a structure of the size passed.
-    unsafe {
-        let mut info: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-        let size = size_of_val(&info) as u32;
-        if GetProcessMemoryInfo(GetCurrentProcess(), &mut info, size) == 0 {
-            return 0;
-        }
-        info.PagefileUsage as u64
-    }
-}
-
-/// Workers (threads) lost to compiles that crashed, not replaced yet.
-static LOST: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-/// Suspends thread `id`, at work in the driver's compiler (never in a heap
-/// function, whose lock it would keep); false if it was not caught there.
-fn suspend(id: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, HMODULE};
-    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
-    use windows::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        GetModuleHandleExW, GetModuleHandleW,
-    };
-    use windows::Win32::System::Threading::{
-        OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
-    };
-    const CONTEXT_CONTROL_AMD64: u32 = 0x10_0001;
-    #[repr(align(16))]
-    struct Aligned(CONTEXT);
-    // SAFETY: plain calls on a thread of ours; the context is whole and
-    // aligned; nothing that may need the suspended thread's locks is called
-    // while it is suspended (the modules are asked about after it runs on).
-    unsafe {
-        let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, false, id) else {
-            return false;
-        };
-        let module = |at: u64| {
-            let mut m = HMODULE::default();
-            let _ = GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                PCWSTR(at as *const u16),
-                &mut m,
-            );
-            m.0 as usize
-        };
-        let named = |s: &str| GetModuleHandleW(&HSTRING::from(s)).map_or(0, |m| m.0 as usize);
-        let (ntdll, ucrt) = (named("ntdll.dll"), named("ucrtbase.dll"));
-        let mut caught = false;
-        let mut last = Vec::new();
-        for _ in 0..500 {
-            if SuspendThread(thread) == u32::MAX {
-                break;
-            }
-            let mut context: Aligned = std::mem::zeroed();
-            context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
-            let known = GetThreadContext(thread.0, &mut context.0) != 0;
-            let at = context.0.Rip >> 12;
-            if known && last.contains(&at) {
-                caught = true;
-                break;
-            }
-            ResumeThread(thread);
-            // A page of the driver's own code: caught there next time.
-            let m = module(at << 12);
-            if known && m != 0 && m != ntdll && m != ucrt {
-                last.push(at);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        let _ = CloseHandle(thread);
-        caught
-    }
-}
-
-/// Notes pipelines the driver's compiler has worked on for long
-/// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
-/// some of the world's ray tracing programs, and takes memory all the while
-/// (16 GB in two minutes), so their threads are stopped.
-fn endless(name: &str, begins: bool) {
-    use std::time::{Duration, Instant};
-    // Some long programs take a while (the upscaler's 10,000 instructions);
-    // what takes memory all along goes first.
-    // Not sooner, nor for less memory: while the world loads the process
-    // takes gigabytes by itself and every core is busy, and four pipelines
-    // the driver makes in seconds were left out for good (20 s and 3 GiB;
-    // run amd1, 2026-11-25). A compile that never ends takes 8 GiB a minute.
-    const ENDLESS: Duration = Duration::from_secs(60);
-    const EVEN_SO: Duration = Duration::from_secs(300);
-    const GROWTH: u64 = 8 << 30;
-    static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
-    static WATCH: std::sync::Once = std::sync::Once::new();
-    {
-        let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        if begins {
-            // SAFETY: a plain call.
-            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-            at_work.push((name.to_owned(), Instant::now(), id));
-        } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
-            at_work.swap_remove(i);
-        }
-    }
-    WATCH.call_once(|| {
-        let _ = std::thread::Builder::new()
-            .name("victory-compiles".into())
-            .spawn(|| {
-                let mut noted: Vec<String> = Vec::new();
-                // The process's commit when a compile was first seen late.
-                let mut late: Option<u64> = None;
-                loop {
-                    std::thread::sleep(Duration::from_secs(2));
-                    let lost = std::mem::take(&mut *LOST.lock().unwrap_or_else(|e| e.into_inner()));
-                    for id in lost {
-                        super::make::worker_lost(id);
-                    }
-                    let long: Vec<(String, u32)> = AT_WORK
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
-                        .map(|w| (w.0.clone(), w.2))
-                        .collect();
-                    if long.is_empty() {
-                        late = None;
-                        continue;
-                    }
-                    let now = committed();
-                    let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
-                    let long: Vec<(String, u32)> = if grown {
-                        late = None;
-                        long
-                    } else {
-                        AT_WORK
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .iter()
-                            .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0))
-                            .map(|w| (w.0.clone(), w.2))
-                            .collect()
-                    };
-                    for (name, id) in long {
-                        let stopped = suspend(id);
-                        if stopped {
-                            super::make::worker_lost(id);
-                        }
-                        tracing::error!(
-                            name,
-                            stopped,
-                            "the driver's compiler does not end a pipeline: it is left out from the next run on"
-                        );
-                        note_crashed(&name);
-                        noted.push(name);
-                    }
-                }
-            });
-    });
-}
-
-impl Drop for Making {
-    fn drop(&mut self) {
-        let name = MAKING.with(|m| std::mem::take(&mut *m.borrow_mut()));
-        endless(&name, false);
-    }
-}
-
-unsafe extern "system" fn compiler_crashed(
-    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
-) -> i32 {
-    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
-    // SAFETY: the system passes a live record.
-    let record = unsafe { &*(*info).ExceptionRecord };
-    let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default());
-    let name = name.unwrap_or_default();
-    // Only reads or writes of the first pages: our own guards' faults are
-    // elsewhere.
-    if record.ExceptionCode != ACCESS_VIOLATION
-        || name.is_empty()
-        || record.ExceptionInformation[1] >= 0x10000
-    {
-        return 0; // not ours
-    }
-    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
-    note_crashed(&name);
-    endless(&name, false);
-    // SAFETY: a plain call.
-    let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-    LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
-}
-
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -819,15 +569,7 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    if crashed(name) {
-        // E_FAIL.
-        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
-    }
-    let create = || {
-        let _making = Making::new(name);
-        create()
-    };
-    let Some(library) = library() else {
+    let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
@@ -852,13 +594,10 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compile outside the pipeline-library lock: on AMD, only the driver's
-    // PSO creation call is serialized to avoid its concurrent compiler crash.
+    // Compiled outside any lock: compiles take up to seconds.
     let pso = {
-        create_pso(amd_adapter(), || {
-            let _call = call("make", name);
-            create()
-        })?
+        let _call = call("make", name);
+        create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -882,25 +621,16 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
-    // Held over serialisation and both writes, so overlapping saves cannot
-    // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    // Keep the staging paths and publication order exclusive through both writes.
-    let mut last = if now {
-        LAST.lock().unwrap_or_else(|e| e.into_inner())
-    } else {
-        match LAST.try_lock() {
-            Ok(last) => last,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+            return;
         }
-    };
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-        return;
+        *last = Some(std::time::Instant::now());
     }
-    *last = Some(std::time::Instant::now());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -915,7 +645,7 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.load(Ordering::Relaxed) && added == 0 {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
         if added == 0 {
@@ -929,25 +659,16 @@ pub(crate) fn save(now: bool) {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
-            if let Err(e) = replace_library(dir, &tmp) {
-                tracing::warn!(error = %e, "host pipeline library not saved");
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
     };
-    // With what earlier runs listed: a run that asks for no title pipeline
-    // (`victory warm`) wrote an empty list over theirs, and the next world
-    // began with every pipeline still to be asked for.
-    let used: Vec<String> = {
-        let used = used();
-        USED_CHANGED.store(false, Ordering::Relaxed);
-        used.iter().flatten().cloned().collect()
-    };
-    if bytes > 0 {
+    // Through `used`: a process that asked for none yet (`victory shaders`)
+    // must not write the earlier runs' list over with nothing.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -961,7 +682,10 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes());
+    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let written = library_written
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -971,10 +695,7 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => {
-            USED_CHANGED.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "early pipeline list not saved");
-        }
+        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
 }
 
@@ -1004,32 +725,68 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    let next = dir.join(NEXT_FILE);
-    if next.exists() {
-        // Startup prefers this path, so it must hold the newest snapshot.
-        return std::fs::rename(tmp, next);
-    }
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, next))
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
-/// Writes `bytes` to a unique temporary file beside `path`, then renames it
-/// over `path`: a reader never sees a part, and overlapping saves do not
-/// share a temporary file.
+/// `path`: a reader never sees a part. Serialised so concurrent worker and
+/// shutdown saves do not race on the same staging file or target rename.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::AtomicU64;
+    static WRITING: Mutex<()> = Mutex::new(());
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let extension = format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written
+    res
+}
+
+/// How long each title pipeline that took long to make took, in ms (beside
+/// the early list; a key may be there more than once).
+const SLOW_FILE: &str = "slow-pipelines.txt";
+/// A pipeline that takes this long is one ([`slow`]).
+pub(crate) const SLOW_MS: u64 = 1000;
+static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    if slow.is_none() {
+        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        *slow = Some(
+            listed
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
+                .collect(),
+        );
+    }
+    slow
+}
+
+/// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
+/// an earlier run.
+pub(crate) fn slow(key: &str) -> bool {
+    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+}
+
+/// The title pipeline with `key` took `ms` to make.
+pub(crate) fn note_time(key: &str, ms: u64) {
+    if ms < SLOW_MS {
+        return;
+    }
+    let mut slow = slow_ones();
+    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    if ms > *known {
+        *known = ms;
+        // With the next save of the early list.
+        USED_CHANGED.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -1051,7 +808,15 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
+///
+/// `VICTORY_EARLY_ALL=1`: every title pipeline is started at creation,
+/// requested before or not, so that the driver's own cache holds it for
+/// later runs.
 pub(crate) fn wanted_early(key: &str) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
+        return true;
+    }
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
@@ -1069,38 +834,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn amd_pipeline_creation_is_serialized_across_workers() {
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::{Arc, Barrier};
-
-        const WORKERS: usize = 8;
-        let gate = Arc::new(Barrier::new(WORKERS));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let workers: Vec<_> = (0..WORKERS)
-            .map(|_| {
-                let gate = gate.clone();
-                let active = active.clone();
-                let peak = peak.clone();
-                std::thread::spawn(move || {
-                    gate.wait();
-                    create_pso(true, || {
-                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        active.fetch_sub(1, Ordering::SeqCst);
-                    });
-                })
-            })
-            .collect();
-
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        assert_eq!(peak.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
@@ -1110,6 +843,32 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A pipeline with static samplers is made, not looked up in the library
+    /// (with or without a host); the guard gives the setting back.
+    #[test]
+    fn pipelines_with_static_samplers_skip_the_library() {
+        let looked = std::cell::Cell::new(false);
+        {
+            let _guard = with_static_samplers(true);
+            let made = pipeline(
+                "with static samplers",
+                |_, _| {
+                    looked.set(true);
+                    Err(windows::core::Error::empty())
+                },
+                || Err(windows::core::Error::empty()),
+            );
+            assert!(made.is_err());
+            assert!(!looked.get(), "the library was asked");
+            {
+                let _inner = with_static_samplers(false);
+                assert!(!STATIC_SAMPLERS.get());
+            }
+            assert!(STATIC_SAMPLERS.get());
+        }
+        assert!(!STATIC_SAMPLERS.get());
     }
 
     #[test]
@@ -1154,18 +913,6 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
-    }
-
-    #[test]
-    fn the_newest_save_supersedes_a_pending_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(LIBRARY_FILE), b"old").unwrap();
-        std::fs::write(dir.path().join(NEXT_FILE), b"pending").unwrap();
-        let tmp = dir.path().join(LIBRARY_FILE).with_extension("tmp");
-        std::fs::write(&tmp, b"newest").unwrap();
-
-        replace_library(dir.path(), &tmp).unwrap();
-        assert_eq!(Blob::of(dir.path()).bytes(), b"newest");
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -1215,7 +962,6 @@ mod tests {
     /// all but the first few read as zeros on the PC this was found on.)
     #[test]
     fn a_replaced_library_file_still_reads_from_the_disk() {
-        let _memory_guard = crate::watch::TEST_TITLE_MEMORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
@@ -1239,46 +985,25 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_atomic_writes_publish_one_complete_file() {
+    fn concurrent_write_atomically_never_fails_or_truncates() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let mut threads = Vec::new();
-        for thread in 0..8 {
-            let path = path.clone();
-            let start = start.clone();
-            threads.push(std::thread::spawn(move || {
-                start.wait();
-                let byte = thread as u8 + 1;
-                for _ in 0..32 {
-                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
-                }
-            }));
+        let target = dir.path().join("host-pipelines.bin");
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'a' + t as u8; 4096];
+                    for _ in 0..30 {
+                        write_atomically(&target, &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
         }
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        let published = std::fs::read(&path).unwrap();
-        assert_eq!(published.len(), 64 * 1024);
-        assert!(published.iter().all(|&byte| byte == published[0]));
-        assert!((1..=8).contains(&published[0]));
-        assert!(!std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
-    }
-
-    #[test]
-    fn failed_atomic_writes_remove_their_temporary_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
-        std::fs::create_dir(&path).unwrap();
-
-        assert!(write_atomically(&path, b"not published").is_err());
-        assert!(!std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }

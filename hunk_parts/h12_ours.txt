@@ -1,0 +1,28 @@
+    /// Up to `max` due slots, with write number and whether a GPU material
+    /// re-enrolled them (only those need an ownership check during upload), in
+    /// the order to serve them. Alternate retries with first looks so a
+    /// backlog of unmapped or partial textures cannot use the whole pass.
+    /// Among first looks, take the newest and oldest writes in turns.
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64, bool)> {
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            class.push((index, w.write, w.recovered));
+        }
+        again.sort_unstable_by_key(|&(_, write, _)| write);
+        fresh.sort_unstable_by_key(|&(_, write, _)| write);
+        let count = max.min(again.len() + fresh.len());
+        let mut fresh = fresh.into_iter();
+        // A time-limited pass may stop after one slot. Rotate its first
+        // choice across frames as well as rotating within each pass.
+        let mut retry = frame & 1 == 0;
+        let mut newest = again.is_empty() || frame & 2 == 0;
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            if !again.is_empty() && (retry || fresh.len() == 0) {
+                order.push(again.pop().unwrap());
+            } else {
+                let next = if newest { fresh.next_back() } else { fresh.next() };
+                order.push(next.unwrap());
+                newest = !newest;

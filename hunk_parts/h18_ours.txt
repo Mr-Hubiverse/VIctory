@@ -1,0 +1,30 @@
+        let make = |count: u32| {
+            if sampler {
+                return create(count);
+            }
+            // A host with room for fewer slots gets no padding.
+            let slots = view_slots(count);
+            create(slots).or_else(|_| create(count + crate::memory::SLOTS))
+        };
+        if sampler && count > SAMPLERS {
+            // shortcut: samplers past the host's limit are left out; tables
+            // reaching them are made afresh in the dynamic slots.
+            tracing::warn!(count, "host sampler heap capped at {SAMPLERS}");
+            let heap = match make(SAMPLERS) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            };
+            return Some(Self::with(
+                host,
+                heap,
+                kind,
+                SAMPLERS - SAMPLER_DYNAMIC,
+                SAMPLER_DYNAMIC,
+                0,
+                SAMPLERS,
+            ));
+        }
+        let extra = if sampler { 0 } else { DYNAMIC };

@@ -1,0 +1,20 @@
+            raw,
+            twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            #[cfg(feature = "diagnostics")]
+            written: (0..if sampler || !crate::book::on() { 0 } else { size })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            made: Made::new(count as usize),
+            quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            copied: Mutex::new(Vec::new()),
+            waiting: Mutex::default(),
+            away: Mutex::default(),
+            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
+            too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            strides,
+            buffers: Slots::new(count as usize),
+            changed: Slots::new(count as usize),
+            textures: Mutex::new(TextureQueue::with_marks(marks.clone())),
+            marks,

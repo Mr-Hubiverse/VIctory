@@ -638,6 +638,7 @@ dependencies = [
  "memchr",
  "tracing",
  "victory-core",
+ "victory-formats",
  "victory-game",
  "victory-hle",
  "victory-loader",
@@ -676,10 +677,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "cc",
  "tempfile",
  "tracing",
- "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",

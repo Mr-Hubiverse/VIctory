@@ -1,0 +1,361 @@
+=== upload_first ===
+crates/victory-gpu/src/descriptor/host.rs:7324:                crate::texture::upload_first(texture, host_tex);
+crates/victory-gpu/src/descriptor/host.rs:7825:                        crate::texture::upload_first(tex_res as crate::object::This, host_tex);
+crates/victory-gpu/src/host.rs:13452:/// Uploads before a submission's lists ([`crate::texture::upload_first`]).
+=== take_first ===
+crates/victory-gpu/src/host.rs:13468:        let first = crate::texture::take_first();
+=== upload_listed ===
+crates/victory-gpu/src/draw.rs:4825:            if crate::texture::upload_listed(list, resource, first) {
+=== UPLOAD_STAGED ===
+crates/victory-gpu/src/draw.rs:4831:            crate::texture::UPLOAD_STAGED.set(false);
+crates/victory-gpu/src/draw.rs:4837:            } else if !crate::texture::UPLOAD_STAGED.get() {
+=== prelude_uploads ===
+crates/victory-gpu/src/host.rs:4351:    /// submission finds it due (`crate::texture::prelude_uploads`).
+crates/victory-gpu/src/host.rs:4352:    prelude_uploads: Vec<crate::texture::PreludeUpload>,
+crates/victory-gpu/src/host.rs:8795:            let uploads = list.prelude_uploads(&mut batch);
+crates/victory-gpu/src/host.rs:10392:    /// `crate::texture::prelude_uploads`) are copied into their host copies
+crates/victory-gpu/src/host.rs:11730:    /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
+crates/victory-gpu/src/host.rs:11734:        deferred.prelude_uploads.push(upload);
+crates/victory-gpu/src/host.rs:11742:    fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+crates/victory-gpu/src/host.rs:11743:        let waiting = self.deferred().prelude_uploads.clone();
+=== PreludeUpload ===
+crates/victory-gpu/src/host.rs:4352:    prelude_uploads: Vec<crate::texture::PreludeUpload>,
+crates/victory-gpu/src/host.rs:10395:    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
+crates/victory-gpu/src/host.rs:11731:    pub(crate) fn defer_prelude_upload(&self, upload: crate::texture::PreludeUpload) {
+crates/victory-gpu/src/host.rs:11742:    fn prelude_uploads(&self, batch: &mut Batch) -> Vec<(crate::texture::PreludeUpload, bool)> {
+=== staging_buffer ===
+crates/victory-hle/src/modules/dstorage.rs:233:extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+crates/victory-hle/src/modules/dstorage.rs:267:    set_staging_buffer_size as *const (), // 0x40
+=== SPARE_STATS ===
+crates/victory-gpu/src/framelog.rs:441:        crate::texture::SPARE_STATS[0].load(Relaxed),
+crates/victory-gpu/src/framelog.rs:442:        crate::texture::SPARE_STATS[1].load(Relaxed),
+=== staging_pool ===
+=== staged_part ===
+=== all_there ===
+=== by_views ===
+=== mapped_bytes ===
+crates/victory-gpu/src/descriptor/host.rs:3858:            || crate::texture::mapped_bytes(start as *const u8, usize::try_from(len).ok()?) != len
+crates/victory-gpu/src/descriptor/host.rs:5013:                if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+crates/victory-gpu/src/descriptor/host.rs:6799:            let mapped = crate::texture::mapped_bytes(start as *const u8, bytes as usize);
+crates/victory-gpu/src/draw.rs:4565:                    if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+crates/victory-gpu/src/draw.rs:4776:                if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+crates/victory-gpu/src/draw.rs:5150:                && crate::texture::mapped_bytes(
+crates/victory-gpu/src/draw.rs:5171:                    Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
+crates/victory-gpu/src/draw.rs:5753:                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+crates/victory-gpu/src/draw.rs:5766:                let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
+crates/victory-gpu/src/draw.rs:9362:    let mapped = crate::texture::mapped_bytes(at as *const u8, bytes as usize);
+crates/victory-gpu/src/resource.rs:2341:                let there = crate::texture::mapped_bytes(at as *const u8, len as usize);
+crates/victory-gpu/src/texture/ahead.rs:134:        staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
+=== note_held ===
+crates/victory-gpu/src/texture/ahead.rs:316:        job.staging.note_held();
+=== levels_changed_after ===
+crates/victory-gpu/src/descriptor/host.rs:672:pub(crate) fn levels_changed_after(start: u64) {
+=== levels_waiting ===
+crates/victory-gpu/src/descriptor/host.rs:968:pub(crate) fn levels_waiting(start: u64) {
+crates/victory-gpu/src/descriptor/host.rs:4025:    /// ([`levels_waiting`]) are due again from the next frame, as memory
+crates/victory-gpu/src/tiles.rs:1467:    fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
+crates/victory-gpu/src/tiles.rs:1551:        a_full_card_keeps_new_levels_waiting(&mut rig);
+=== movie_plane ===
+=== hot_textures ===
+=== unseen_write ===
+=== refresh_ahead ===
+crates/victory-gpu/src/host.rs:8788:            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+crates/victory-gpu/src/host.rs:11714:    /// ([`crate::texture::Staging::refresh_ahead`]); how many were left.
+crates/victory-gpu/src/host.rs:11725:        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
+crates/victory-gpu/src/host.rs:12502:    /// range (from, to) ([`Batch::refresh_ahead`]).
+crates/victory-gpu/src/host.rs:13197:    fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
+=== system_ram_idle_ms ===
+crates/victory-gpu/src/host/queue2_tests.rs:400:        use super::{system_ram_idle_ms, texture_idle_ms};
+crates/victory-gpu/src/host/queue2_tests.rs:406:        assert_eq!(system_ram_idle_ms(enough_memory), 10_000);
+crates/victory-gpu/src/host/queue2_tests.rs:410:        assert_eq!(system_ram_idle_ms(low_commit), 500);
+crates/victory-gpu/src/host.rs:532:pub(crate) fn system_ram_idle_ms(available: Option<(u64, u64)>) -> u64 {
+crates/victory-gpu/src/host.rs:546:    vram_idle_ms(video_memory).min(system_ram_idle_ms(available))
+crates/victory-gpu/src/pipeline/library.rs:458:    let quiet_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
+crates/victory-gpu/src/shadow.rs:4128:        let idle_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
+=== available_system_memory ===
+crates/victory-gpu/src/host.rs:226:pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
+crates/victory-gpu/src/host.rs:603:    let available = available_system_memory();
+crates/victory-gpu/src/pipeline/library.rs:458:    let quiet_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
+crates/victory-gpu/src/resource.rs:2420:        crate::host::available_system_memory(),
+crates/victory-gpu/src/shadow.rs:4128:        let idle_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
+=== ram_idle_ms ===
+crates/victory-gpu/src/host/batch.rs:73:    fn vram_idle_ms_scales_with_pressure() {
+crates/victory-gpu/src/host/batch.rs:74:        use super::vram_idle_ms;
+crates/victory-gpu/src/host/batch.rs:77:        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
+crates/victory-gpu/src/host/batch.rs:78:        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
+crates/victory-gpu/src/host/batch.rs:79:        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+crates/victory-gpu/src/host/batch.rs:81:        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
+crates/victory-gpu/src/host/batch.rs:82:        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+crates/victory-gpu/src/host/batch.rs:84:        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+crates/victory-gpu/src/host/batch.rs:85:        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+crates/victory-gpu/src/host/batch.rs:87:        assert_eq!(vram_idle_ms(None), 5_000);
+crates/victory-gpu/src/host/batch.rs:88:        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+crates/victory-gpu/src/host/batch.rs:92:    fn ram_idle_ms_scales_with_pressure() {
+=== headroom ===
+crates/victory-gpu/src/host/queue2_tests.rs:334:    fn commit_idle_ms_scales_with_commit_headroom() {
+crates/victory-gpu/src/host/queue2_tests.rs:367:    fn critical_commit_headroom_forces_cache_sweep() {
+crates/victory-gpu/src/host.rs:223:/// Available physical RAM and process commit headroom in bytes, from
+crates/victory-gpu/src/host.rs:481:    let effective = match (avail_phys, crate::residency::headroom()) {
+crates/victory-gpu/src/host.rs:509:/// Idle timeout for system-RAM caches when process commit headroom is low.
+crates/victory-gpu/src/pipeline/make.rs:726:/// 20 s of headroom for frame preparation, copies, RT work and presentation
+crates/victory-gpu/src/pool.rs:390:        // headroom; table-bound textures and decoration bakes are sampled
+crates/victory-gpu/src/residency.rs:61:    // commit headroom sits in the 1-4 GiB range on 32 GiB hosts.
+crates/victory-gpu/src/residency.rs:67:    // requires more headroom than reusing slices already committed inside the
+crates/victory-gpu/src/residency.rs:133:pub(crate) fn headroom() -> Option<u64> {
+crates/victory-gpu/src/residency.rs:142:/// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
+crates/victory-gpu/src/shadow.rs:285:///   still leave headroom for textures and render targets.
+=== upload_refused ===
+crates/victory-gpu/src/draw.rs:4590:                            let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
+crates/victory-gpu/src/draw.rs:4835:            } else if crate::residency::upload_refused() {
+crates/victory-gpu/src/draw.rs:5955:            if crate::residency::upload_refused() {
+crates/victory-gpu/src/draw.rs:5971:            if crate::residency::upload_refused() {
+crates/victory-gpu/src/draw.rs:6068:            if ahead.is_none() && crate::residency::upload_refused() {
+crates/victory-gpu/src/draw.rs:6087:                && (crate::residency::take_staging_deferred() || crate::residency::upload_refused())
+crates/victory-gpu/src/residency.rs:41:pub(crate) fn upload_refused() -> bool {
+=== allow_staging_growth ===
+crates/victory-gpu/src/pool.rs:393:        if speculative && !crate::residency::allow_staging_growth(false) {
+crates/victory-gpu/src/residency.rs:85:pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+crates/victory-gpu/src/texture/ahead.rs:108:    if !crate::residency::allow_staging_growth(false)
+=== note_staging_deferred ===
+crates/victory-gpu/src/residency.rs:33:pub(crate) fn note_staging_deferred() {
+=== pool::staging ===
+=== pool::on ===
+crates/victory-gpu/src/host.rs:10483:            if crate::pool::on() && *first_upload {
+=== is_host_written ===
+=== gpu_uploads ===
+=== shown_bytes ===
+crates/victory-gpu/src/book.rs:514:        let read = crate::descriptor::host::shown_bytes(at, CHUNK);
+crates/victory-gpu/src/book.rs:541:            let Some((_, again, _)) = crate::descriptor::host::shown_bytes(slot, 1) else { continue };
+crates/victory-gpu/src/book.rs:622:    while let Some((first, bytes, end)) = crate::descriptor::host::shown_bytes(at, 16_384) {
+crates/victory-gpu/src/descriptor/host.rs:2653:pub(crate) fn shown_bytes(at: u32, n: u32) -> Option<(u32, Vec<u8>, u32)> {
+crates/victory-gpu/src/inplace.rs:736:pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
+crates/victory-gpu/src/inplace.rs:1599:        let shown = |from: usize, len: usize| super::shown_bytes(at + from, len);
+=== no_wait ===
+crates/victory-gpu/src/texture/ahead.rs:133:    if super::no_wait() && super::fill_unlocked() {
+=== fill_unlocked ===
+crates/victory-gpu/src/descriptor/host.rs:974:/// (`crate::texture::fill_unlocked`), whose slots the next texture pass
+crates/victory-gpu/src/texture/ahead.rs:133:    if super::no_wait() && super::fill_unlocked() {
+=== note_read ===
+crates/victory-gpu/src/host.rs:10799:    pub(crate) fn note_read(&self, what: impl FnOnce() -> String, range: (u64, u64)) {
+crates/victory-gpu/src/list.rs:1537:                Some(range) => list.note_read(text, range),
+=== ensure_state ===
+crates/victory-gpu/src/capture.rs:526:        crate::list::ensure_state(list, resource as crate::object::This, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+crates/victory-gpu/src/capture.rs:848:    crate::list::ensure_state(list, resource, 0x800);
+crates/victory-gpu/src/capture.rs:853:        crate::list::ensure_state(list, resource, 0x4);
+crates/victory-gpu/src/descriptor/host.rs:7328:            crate::list::ensure_state(list, texture, SHADER_RESOURCE);
+crates/victory-gpu/src/draw.rs:3403:            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+crates/victory-gpu/src/draw.rs:3423:            crate::list::ensure_state(list, self.depth as This, state);
+crates/victory-gpu/src/draw.rs:9290:            crate::list::ensure_state(list, *resource as This, state);
+crates/victory-gpu/src/draw.rs:9318:                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+crates/victory-gpu/src/external.rs:23:    crate::list::ensure_state(list, resource, state);
+crates/victory-gpu/src/list.rs:1138:pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+crates/victory-gpu/src/list.rs:1283:            ensure_state(list, dst, COPY_DEST);
+crates/victory-gpu/src/list.rs:1284:            ensure_state(list, src, COPY_SOURCE);
+=== first_use ===
+crates/victory-gpu/src/draw.rs:1993:        if srv && list.first_use(shadow.buffer.as_raw() as usize) {
+crates/victory-gpu/src/draw.rs:3737:                        if list.first_use(buffer.as_raw() as usize) { list.keep(buffer); }
+crates/victory-gpu/src/draw.rs:4177:        if !list.first_use(gpu as usize | 1) {
+crates/victory-gpu/src/draw.rs:4348:        if list.first_use(gpu as usize | 2)
+crates/victory-gpu/src/draw.rs:8144:        if list.first_use(BATCH_USE) {
+crates/victory-gpu/src/draw.rs:8374:        let first_on_list = list.first_use(WINDOW_USE);
+crates/victory-gpu/src/host/submission.rs:2629:            text.push_str(&first_uses_text(runs, true));
+crates/victory-gpu/src/host.rs:1254:/// ([`first_use`]), since the start.
+crates/victory-gpu/src/host.rs:1266:pub(crate) fn first_use(name: &str) {
+crates/victory-gpu/src/host.rs:1279:fn first_uses_text(runs: &[&HostList], bound: bool) -> String {
+crates/victory-gpu/src/host.rs:1387:    tracing::error!("when the host device went{}", first_uses_text(&[], false));
+crates/victory-gpu/src/host.rs:11574:    pub(crate) fn first_use(&self, key: usize) -> bool {
+=== host_copy ===
+crates/victory-gpu/src/ambient/raise.rs:132:    let Some(copy) = crate::resource::host_copy(image as This) else { return };
+crates/victory-gpu/src/capture.rs:422:    let copy = crate::resource::host_copy(resource as crate::object::This)?;
+crates/victory-gpu/src/capture.rs:518:        let Some(copy) = crate::resource::host_copy(resource as crate::object::This) else { continue };
+crates/victory-gpu/src/capture.rs:941:    let Some(copy) = crate::resource::host_copy(resource) else {
+crates/victory-gpu/src/capture.rs:984:        && let Some(copy) = crate::resource::host_copy(resource)
+crates/victory-gpu/src/descriptor/host.rs:5915:                    crate::resource::host_copy(*r as crate::object::This)
+crates/victory-gpu/src/descriptor/host.rs:9312:            if let Some(copy) = crate::resource::host_copy(resource) {
+crates/victory-gpu/src/descriptor/host.rs:10964:    fn views_count_from_the_first_level_of_the_host_copy() {
+crates/victory-gpu/src/descriptor/host.rs:12978:        let original = crate::resource::host_copy(texture).unwrap();
+crates/victory-gpu/src/descriptor.rs:1742:        let _ = crate::resource::host_copy(resource as This);
+crates/victory-gpu/src/draw.rs:349:            no_host_copy = n[4],
+crates/victory-gpu/src/draw.rs:363:            no_host_copy = all[4],
+=== read_from ===
+crates/victory-gpu/src/host.rs:2335:    fn views_in_the_books_alone_are_read_from_their_pages() {
+crates/victory-gpu/src/resource.rs:1386:pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -> u32 {
+crates/victory-gpu/src/resource.rs:1395:/// host can have as a texture's level 0 ([`read_from`]; block-compressed
+crates/victory-gpu/src/resource.rs:1417:    let mut base = read_from(layout, first).min(u32::from(desc.mip_levels) - 1);
+crates/victory-gpu/src/resource.rs:1446:            Some(layout.bytes_from(read_from(layout, first)).min(whole))
+crates/victory-hle/src/modules/xmem.rs:3961:    fn views_in_the_books_alone_are_read_from_their_pages() {
+crates/victory-shader/src/resource.rs:4520:    fn descriptors_read_from_the_first_lane_of_per_lane_loads_are_traced_to_them() {
+crates/victory-shader/src/resource.rs:4552:    fn descriptors_read_from_the_first_lane_of_a_per_lane_choice_are_traced_per_lane() {
+crates/victory-shader/src/resource.rs:4824:    fn descriptors_read_from_the_first_lane_of_buffer_loads_over_a_table_are_fetched() {
+crates/victory-shader/src/resource.rs:4841:    fn descriptors_read_from_the_first_lane_of_lds_fail_naming_it() {
+crates/victory-shader/src/resource.rs:4900:    fn descriptors_read_from_the_first_lane_of_an_if_else_join_are_traced_per_path() {
+crates/victory-shader/src/resource.rs:4982:    fn descriptors_read_from_the_first_lane_of_a_loop_carried_phi_are_its_one_source() {
+=== at_title_address ===
+crates/victory-gpu/src/resource.rs:3529:pub(crate) fn at_title_address(this: This) -> bool {
+crates/victory-gpu/src/resource.rs:4741:        assert!(!at_title_address(committed));
+crates/victory-gpu/src/resource.rs:4745:        assert!(!at_title_address(placed));
+crates/victory-gpu/src/resource.rs:4752:        assert!(at_title_address(at));
+crates/victory-gpu/src/resource.rs:4753:        assert!(!at_title_address(null));
+=== held_only ===
+crates/victory-gpu/src/descriptor/host.rs:9551:/// on (`crate::resource::held_only`). What it shows of larger ones, if any,
+crates/victory-gpu/src/draw.rs:5922:                && crate::resource::held_only()
+crates/victory-gpu/src/host.rs:15117:            if crate::resource::held_only() {
+crates/victory-gpu/src/resource.rs:1289:    /// The title's level its level 0 is ([`held_only`]): larger levels have
+crates/victory-gpu/src/resource.rs:1366:pub(crate) fn held_only() -> bool {
+crates/victory-gpu/src/resource.rs:1430:    if first == 0 || !held_only() {
+crates/victory-gpu/src/resource.rs:1470:    if this.is_null() || !held_only() {
+crates/victory-gpu/src/resource.rs:1792:        // The levels views show ([`held_only`]), those of the slots shaders
+crates/victory-gpu/src/resource.rs:1795:        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+crates/victory-gpu/src/resource.rs:6397:        if crate::host::host().is_none() || !held_only() {
+=== texture::upload ===
+crates/victory-gpu/src/descriptor/host.rs:7324:                crate::texture::upload_first(texture, host_tex);
+crates/victory-gpu/src/descriptor/host.rs:7325:                crate::texture::upload(list, texture, host_tex);
+crates/victory-gpu/src/descriptor/host.rs:7825:                        crate::texture::upload_first(tex_res as crate::object::This, host_tex);
+crates/victory-gpu/src/draw.rs:4825:            if crate::texture::upload_listed(list, resource, first) {
+crates/victory-gpu/src/draw.rs:5990:                crate::texture::upload_again(resource);
+crates/victory-gpu/src/draw.rs:9274:                crate::texture::upload_from(list, *resource as This, t, first);
+crates/victory-gpu/src/draw.rs:9276:                crate::texture::upload_from(list, *resource as This, first);
+crates/victory-gpu/src/external.rs:34:        crate::texture::upload_from(list, resource, 0);
+crates/victory-gpu/src/host.rs:13452:/// Uploads before a submission's lists ([`crate::texture::upload_first`]).
+crates/victory-gpu/src/list.rs:1262:                crate::texture::upload(list, src, from);
+crates/victory-gpu/src/list.rs:1462:                crate::texture::upload(list, src.resource, texture);
+crates/victory-gpu/src/list.rs:1498:                crate::texture::upload(list, dst.resource, to);
+=== Digest ===
+crates/victory-gpu/src/resource.rs:1310:pub(crate) type Holds = std::sync::Mutex<Option<(u32, crate::texture::Digest)>>;
+crates/victory-gpu/src/resource.rs:4120:pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Digest)> {
+=== detiled ===
+crates/victory-gpu/src/copystat.rs:35:    /// Texture bytes detiled after a watched write; hashed; detiled after a
+crates/victory-gpu/src/host.rs:12730:/// They are read, hashed and, if they changed, detiled into their staging
+crates/victory-gpu/src/host.rs:13728:/// the write watch or guards asked, then the memory hashed and detiled if
+crates/victory-gpu/src/pool.rs:404:        // What is not detiled into it (an unmapped texture) uploads zeros,
+crates/victory-gpu/src/texture/ahead.rs:2://! (`VICTORY_UPLOAD_AHEAD`): read, detiled and copied by threads of ours as
+=== grown ===
+crates/victory-gpu/src/host.rs:2512:    /// grown to the largest indirect execution recorded on the list.
+crates/victory-gpu/src/host.rs:12521:    /// each made them anew, grown from nothing (hash tables rehashed as
+crates/victory-gpu/src/host.rs:15118:                let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
+crates/victory-gpu/src/host.rs:15122:                     levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
+crates/victory-gpu/src/indirect.rs:4046:        let grown = list.indirect_scratch(5000 * 20).unwrap();
+crates/victory-gpu/src/indirect.rs:4048:            list.indirect_state(&grown),
+crates/victory-gpu/src/indirect.rs:4057:        assert_eq!(b3.as_raw(), grown.as_raw());
+crates/victory-gpu/src/indirect.rs:4078:        // After reset, requests up to the grown high-water mark reuse `b3` with
+crates/victory-gpu/src/indirect.rs:4094:            "grown scratch buffer must persist across reset"
+crates/victory-gpu/src/memory.rs:2147:        let grown = heap.raw_page_views(&memory.copies).unwrap();
+crates/victory-gpu/src/memory.rs:2148:        assert_ne!(grown.0, initial.0);
+crates/victory-gpu/src/memory.rs:2149:        assert!(grown.1 as usize > SPECULATIVE_COPIES);
+=== level0 ===
+crates/victory-gpu/src/texture/ahead.rs:128:        !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+crates/victory-gpu/src/texture/ahead.rs:295:                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: s.first - s.level0 + i as u32 },
+=== holds ===
+crates/victory-formats/src/bcpack.rs:147:            // Model 16 g + shape has g + 2 buckets; bucket b > 0 holds 2^(b-1) symbols.
+crates/victory-formats/src/bcpack.rs:360:            // Bucket 0 holds symbol 0, which owns slots 1 .. f[0] - 1 (slot 0
+crates/victory-formats/src/bcpack.rs:361:            // is never used). Bucket b > 0 holds 2^(b-1) symbols of frequency
+crates/victory-formats/src/bcpack.rs:1412:            s[4] = zigzag(0x21); // stored R0 (holds alpha precision after rot=1)
+crates/victory-formats/src/bcpack.rs:1418:            s[10] = zigzag(0x0d); // stored A0 (holds color precision after rot=1)
+crates/victory-formats/src/bcpack.rs:1460:        // Headers promising more payload than the stream holds. (Other corrupt
+crates/victory-formats/src/bcpack.rs:1655:            // One fragment per lane holds at most 65792 bytes.
+crates/victory-formats/src/bcpack.rs:1703:    /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
+crates/victory-formats/src/xma.rs:182:        // a packet with none (a frame spans all of it) holds no start.
+crates/victory-formats/src/xma.rs:1162:/// FFmpeg's `vector_fmul_window` in place: the first half of `block` holds
+crates/victory-formats/src/xma.rs:1216:        // Packet 1 is all of one frame; packet 2 holds only its last 64 bits.
+crates/victory-game/src/sgd5.rs:1://! `SGD5`: the engine's shader file. Each record holds one shader container,
+=== upload_key ===
+=== staged_from ===
+=== record_upload ===
+=== fill_plane ===
+=== claim_upload ===
+=== finish_refresh ===
+crates/victory-gpu/src/host.rs:11750:            .filter_map(|upload| upload.finish_refresh().map(|first| (upload, first)))
+=== list.used ===
+crates/victory-gpu/src/list.rs:1491:            if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
+crates/victory-gpu/src/list.rs:1501:            if list.used(dst.resource as usize) {
+crates/victory-gpu/src/picked.rs:272:    if !on() || !runs.iter().any(|list| list.used(KEY)) {
+=== title_memory_reading ===
+crates/victory-gpu/src/backreads.rs:299:    let Some(_still) = crate::watch::title_memory_reading_now(0..usize::MAX) else {
+crates/victory-gpu/src/backreads.rs:321:        match crate::watch::title_memory_reading_now(0..usize::MAX) {
+crates/victory-gpu/src/draw.rs:7961:                // the read (see `crate::watch::title_memory_reading`): while
+crates/victory-gpu/src/draw.rs:7965:                let held = (!crate::host::read_into(from as *const u8, &mut read)).then(crate::watch::title_memory_reading);
+crates/victory-gpu/src/inplace.rs:343:        // (`crate::watch::title_memory_reading`), which came before this.
+crates/victory-gpu/src/inplace.rs:666:    let _still = crate::watch::title_memory_reading_now(0..usize::MAX)?;
+crates/victory-gpu/src/inplace.rs:850:/// `crate::watch::title_memory_reading`: until it lets go the title sees
+crates/victory-gpu/src/inplace.rs:887:/// `crate::watch::title_memory_reading`.
+crates/victory-gpu/src/land.rs:592:    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+crates/victory-gpu/src/lib.rs:183:    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
+crates/victory-gpu/src/lib.rs:188:    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+crates/victory-gpu/src/texback.rs:117:        let _mapping = crate::watch::title_memory_reading();
+=== refresh_unlocked ===
+=== refresh_now ===
+crates/victory-gpu/src/watch.rs:4354:/// run 74 in the hash before it, both under `Staging::refresh_now`, which
+=== once() ===
+crates/victory-gpu/src/ambient.rs:188:fn once() -> bool {
+crates/victory-gpu/src/ambient.rs:736:    words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+crates/victory-gpu/src/descriptor/host.rs:10425:    fn texture_remaps_visit_each_changed_region_once() {
+crates/victory-gpu/src/descriptor.rs:1050:fn page_at_once() -> bool {
+crates/victory-gpu/src/draw.rs:7463:                let once = ready_once() && selected.is_empty() && !group.has_uav;
+crates/victory-gpu/src/draw.rs:9195:fn ready_once() -> bool {
+crates/victory-gpu/src/draw.rs:10030:    fn bake_candidates_are_texture_slots_once() {
+crates/victory-gpu/src/host/submission.rs:2197:        if crate::watch::once() {
+crates/victory-gpu/src/host.rs:6750:fn declare_once() -> bool {
+crates/victory-gpu/src/host.rs:8750:        if crate::watch::once() {
+crates/victory-gpu/src/host.rs:11120:        if deferred.gpu_written.insert(key) || !declare_once() {
+crates/victory-gpu/src/host.rs:11127:        if deferred.gpu_written.insert(key) || !declare_once() {
+=== PICKING ===
+crates/victory-gpu/src/draw.rs:6079:                crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+crates/victory-gpu/src/draw.rs:6081:                crate::texture::PICKING.set(None);
+crates/victory-gpu/src/pool.rs:392:        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+crates/victory-gpu/src/texture/ahead.rs:124:    super::PICKING.set(Some(there));
+crates/victory-gpu/src/texture/ahead.rs:126:    super::PICKING.set(None);
+=== BAKING ===
+crates/victory-gpu/src/descriptor/host.rs:4811:            && !crate::texture::BAKING.get()
+crates/victory-gpu/src/draw.rs:264:/// wait for title memory that is being remapped (`crate::texture` `BAKING`).
+crates/victory-gpu/src/draw.rs:4824:            // `BAKING`: read exactly at submission): nothing more to do.
+crates/victory-gpu/src/draw.rs:4957:                crate::texture::BAKING.set(exact);
+crates/victory-gpu/src/draw.rs:4988:                // `BAKING`, on the bake's own list).
+crates/victory-gpu/src/draw.rs:4992:                crate::texture::BAKING.set(false);
+crates/victory-gpu/src/draw.rs:5013:            crate::texture::BAKING.set(exact);
+crates/victory-gpu/src/draw.rs:5015:            crate::texture::BAKING.set(false);
+crates/victory-gpu/src/draw.rs:5028:            crate::texture::BAKING.set(exact);
+crates/victory-gpu/src/draw.rs:5030:            crate::texture::BAKING.set(false);
+crates/victory-gpu/src/draw.rs:5421:        let baking = crate::texture::BAKING.get();
+crates/victory-gpu/src/pool.rs:392:        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+=== upload_listed ===
+crates/victory-gpu/src/draw.rs:4825:            if crate::texture::upload_listed(list, resource, first) {
+=== defer_texture ===
+crates/victory-gpu/src/capture.rs:511:        defer_texture_png(list, i.buffer, i.footprint, name);
+crates/victory-gpu/src/capture.rs:530:        defer_texture_png(list, buffer, footprint, name);
+crates/victory-gpu/src/capture.rs:534:fn defer_texture_png(
+crates/victory-gpu/src/host.rs:11703:    pub(crate) fn defer_texture(
+crates/victory-gpu/src/host.rs:11728:    /// [`HostList::defer_texture`] of a texture whose upload the list's
+=== expected ===
+crates/victory-formats/src/bcpack.rs:1403:                let mut expected_prec = base_bits;
+crates/victory-formats/src/bcpack.rs:1404:                expected_prec.swap(3, rot - 1);
+crates/victory-formats/src/bcpack.rs:1405:                assert_eq!(bc7_precision(ctrl), expected_prec, "mode {mode} rot {rot}");
+crates/victory-formats/src/xma.rs:1458:                let expected = bits.bits(8).map(|v| v as u8);
+crates/victory-formats/src/xma.rs:1459:                assert_eq!(bytes.byte(), expected, "bit {pos}");
+crates/victory-formats/src/xma.rs:1460:                if expected.is_some() {
+crates/victory-gpu/src/backreads.rs:304:        // not locked fails, as expected, and takes them out of it; an
+crates/victory-gpu/src/card.rs:1085:            assert!(before2.is_none(), "no CPU dirty uploads expected in phase 2");
+crates/victory-gpu/src/compose.rs:343:            for (actual, expected) in pixels
+crates/victory-gpu/src/compose.rs:348:                    actual.abs_diff(expected) <= 1,
+crates/victory-gpu/src/compose.rs:349:                    "unexpected composite {pixels:?}"
+crates/victory-gpu/src/descriptor/host.rs:10410:        fn unexpected(_: u32) -> bool {
+=== serial ===
+crates/victory-core/src/config.rs:10:use serde::Deserialize;
+crates/victory-core/src/config.rs:29:#[derive(Debug, Default, Deserialize)]
+crates/victory-core/src/config.rs:36:#[derive(Debug, Default, Deserialize)]
+crates/victory-gpu/examples/capture_probe.rs:41:        let mut d: Option<ID3D12VersionedRootSignatureDeserializer> = None;
+crates/victory-gpu/examples/capture_probe.rs:42:        let r = D3D12CreateVersionedRootSignatureDeserializer(
+crates/victory-gpu/examples/capture_probe.rs:45:            &<ID3D12VersionedRootSignatureDeserializer as windows::core::Interface>::IID,
+crates/victory-gpu/examples/capture_probe.rs:49:            println!("  root signature: no deserializer {r:?}");
+crates/victory-gpu/src/descriptor/host.rs:3713:    /// same slot lock that serializes later descriptor copies and replacements.
+crates/victory-gpu/src/device.rs:447:    // The root signature's serialized form, once per root object.
+crates/victory-gpu/src/pipeline/host.rs:1374:        if let Err(e) = victory_shader::emit::agility::serialize_versioned_root_signature(
+crates/victory-gpu/src/pipeline/library.rs:71:            tracing::info!("serializing host pipeline creation on AMD D3D12");
+crates/victory-gpu/src/pipeline/library.rs:77:fn create_pso<T>(serialize: bool, create: impl FnOnce() -> T) -> T {
+=== Spare ===
+crates/victory-gpu/src/host/spare.rs:1:    use super::Spare;
+crates/victory-gpu/src/host/spare.rs:7:        let mut spare: Spare<u32> = Spare::new();
+crates/victory-gpu/src/host.rs:1586:/// next list, [`Spare`]) and their bytes; chunks taken from those kept
+crates/victory-gpu/src/host.rs:3593:struct Spare<T> {
+crates/victory-gpu/src/host.rs:3598:impl<T> Spare<T> {
+crates/victory-gpu/src/host.rs:3600:        Spare { kept: Vec::new(), bytes: 0 }
+crates/victory-gpu/src/host.rs:3623:static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());

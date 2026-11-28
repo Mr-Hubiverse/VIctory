@@ -1,0 +1,10 @@
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
+        for &slot in &slots {
+            textures.changed(slot, frame, frame + 1);

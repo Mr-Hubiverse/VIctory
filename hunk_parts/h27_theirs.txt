@@ -1,0 +1,10 @@
+    /// See [`TextureQueue::hold`].
+    pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
+        self.queue(super::queue_site::TELL).hold(index, write, due);
+    }
+
+    /// See [`TextureQueue::room`].
+    pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
+        self.queue(super::queue_site::MADE_DUE).room(frame)
+    }
+

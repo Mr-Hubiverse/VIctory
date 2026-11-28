@@ -1,0 +1,3 @@
+            .chain(self.by_start.range(start..end).map(|(_, span)| span))
+            .flat_map(|span| span.1.iter().copied())
+            .filter(|&slot| self.reaches(slot, start))

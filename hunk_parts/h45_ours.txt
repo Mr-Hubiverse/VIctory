@@ -1,0 +1,23 @@
+        // Made from this record already ([`heap_locks`]): what the lock
+        // would find, without it. (The view is looked up first, as under
+        // the lock: a record whose view is gone is not served here.)
+        if tag == VIEW_TAG
+            && heap_locks()
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_FAST);
+                    if !self.sampler {
+                if view.is_buffer() {
+                    let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
+                    self.track_bindless(index, (i, generation), placed);
+                } else {
+                    self.untrack_bindless(index);
+                }
+            }
+            return Ok(Some(view));
+        }
+        let mut made = locked(&self.made, 4);
+        #[cfg(feature = "diagnostics")]
+        let held = Held::start(for_draw);

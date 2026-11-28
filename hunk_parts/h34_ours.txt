@@ -1,0 +1,3 @@
+    pub(crate) fn texture_slot_gone(&self, index: u32, write: u64) -> bool {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.get(index as usize).is_none_or(|&key| key == 0) || !self.queued_write_current(index, write) {

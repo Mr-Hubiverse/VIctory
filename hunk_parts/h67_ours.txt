@@ -1,0 +1,741 @@
+    /// A sampler heap past the host's limit is capped, not lost, and keeps
+    /// dynamic slots for the tables reaching past what it holds.
+    #[test]
+    fn large_sampler_heap_is_capped() {
+        let Some(heap) = HostHeap::new(true, 4 * SAMPLERS) else {
+            return; // no host GPU
+        };
+        let count = SAMPLERS - SAMPLER_DYNAMIC;
+        assert_eq!(heap.count(), count);
+        assert_eq!(heap.dynamic(SAMPLER_DYNAMIC + 1), None);
+        let a = heap.dynamic(SAMPLER_DYNAMIC).unwrap();
+        assert_eq!(a, count);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(heap.id(), a, 8, false);
+        assert_eq!(heap.dynamic(8), Some(count));
+    }
+
+    /// A sampler heap within the limit has a slot per title slot and no
+    /// dynamic ones.
+    #[test]
+    fn small_sampler_heap_has_no_dynamic_slots() {
+        let Some(heap) = HostHeap::new(true, 16) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), 16);
+        assert_eq!(heap.dynamic(1), None);
+    }
+
+    /// A structured view whose start in its host copy is not on an element
+    /// becomes the raw view of the same bytes, where those start 16-byte
+    /// aligned.
+    #[test]
+    fn structured_views_off_an_element_are_raw_views_of_the_same_bytes() {
+        // (offset in the copy, first element, elements, stride)
+        for (offset, first, count, stride) in [
+            (16, 0, 4, 32),
+            (48, 3, 7, 32),
+            (4096 + 16, 1, 1, 48),
+            (32, 0, 9, 12),
+        ] {
+            let (dword, dwords) = raw_window(offset, first, count, stride).unwrap();
+            assert_eq!(dword * 4, offset + first * u64::from(stride));
+            assert_eq!(u64::from(dwords) * 4, u64::from(count) * u64::from(stride));
+        }
+        // Not 16-byte aligned, strides raw views cannot cover, too long.
+        assert_eq!(raw_window(8, 0, 4, 32), None);
+        assert_eq!(raw_window(16, 1, 4, 12), None);
+        assert_eq!(raw_window(16, 0, 4, 6), None);
+        assert_eq!(raw_window(16, 0, 4, 0), None);
+        assert_eq!(raw_window(16, 0, u32::MAX, 32), None);
+    }
+
+    /// A structured view (32-byte elements) 16 bytes into its host copy,
+    /// read and another written by a shader: it reads the title's bytes from
+    /// there, and what it writes lands at its own bytes of title memory.
+    #[test]
+    fn structured_views_off_an_element_read_and_write_their_bytes() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0, numDescriptors = 2))"
+ByteAddressBuffer view : register(t0);
+RWByteAddressBuffer window : register(u0);
+RWByteAddressBuffer seen : register(u1);
+[RootSignature(RS)]
+[numthreads(32, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    seen.Store(id.x * 4, view.Load(id.x * 4));
+    window.Store(id.x * 4, 0xc0de0000u | id.x);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointer ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("views"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        let device = &host.device;
+        // SAFETY: the blob's own bytes, with the root signature inside;
+        // plain object creation.
+        let (root, pso, views, step) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let views: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            (root, pso, views, step as usize)
+        };
+        // SAFETY: a live heap.
+        let first = unsafe { views.GetCPUDescriptorHandleForHeapStart() }.ptr;
+        let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: first + i * step,
+        };
+
+        // A title buffer of 1 KiB, numbered dwords; four 32-byte elements
+        // from byte 16 are read, four from byte 272 written.
+        let before: Vec<u32> = (0..256).map(|i| 0x7171_0000 | i).collect();
+        let mut title = before.clone();
+        let start = title.as_mut_ptr() as u64;
+        crate::shadow::register(start as usize, start, 1024);
+        let shadow = crate::shadow::find(start, 1024).unwrap();
+        let structured = D3D12_BUFFER_SRV {
+            NumElements: 4,
+            StructureByteStride: 32,
+            ..Default::default()
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: structured },
+        };
+        let uav = |buffer| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: buffer },
+        };
+        let written = D3D12_BUFFER_UAV {
+            NumElements: 4,
+            StructureByteStride: 32,
+            ..Default::default()
+        };
+        // Views the host refuses are left null, as `HostHeap::mirror` leaves them.
+        let mut placed = [0; 14];
+        placed[0] = 1; // a buffer
+        if buffer_srv(start + 16, 128, srv, at(0)).is_none() {
+            null_for(&View::Placed(false, placed, [0; 16]), at(0));
+        }
+        if buffer_uav(start + 272, 128, uav(written), at(1)).is_none() {
+            null_for(&View::Placed(true, placed, [0; 16]), at(1));
+        }
+        // What the shader read, as a raw view of 32 dwords of our own.
+        let (seen, out) = host.shared_buffer(128).unwrap();
+        let mut raw = uav(D3D12_BUFFER_UAV {
+            NumElements: 32,
+            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+            ..Default::default()
+        });
+        raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        // SAFETY: a live buffer and a slot of our heap.
+        unsafe {
+            device.CreateUnorderedAccessView(&seen, None::<&ID3D12Resource>, Some(&raw), at(2))
+        };
+
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, start, 1024);
+        shadow.gpu_writes(&list, start + 272, 128, false);
+        // SAFETY: an open list; our heap, root signature and pipeline.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        crate::shadow::unregister(start as usize, start);
+
+        // SAFETY: 32 dwords the GPU wrote, read after it finished.
+        let seen = unsafe { std::slice::from_raw_parts(out.cast::<u32>(), 32) };
+        assert_eq!(seen, &before[4..36], "what the read view gave");
+        let marks: Vec<u32> = (0..32).map(|i| 0xc0de_0000 | i).collect();
+        assert_eq!(&title[68..100], &marks[..], "what the written view left");
+        assert_eq!(
+            (&title[..68], &title[100..]),
+            (&before[..68], &before[100..])
+        );
+    }
+
+    /// End-to-end GPU execution test proving that buffer SRVs, 16-byte-aligned
+    /// CBVs, copied buffer SRVs, `View::Placed` streamed textures, and buffer
+    /// UAVs in a shader-visible heap materialize non-null host descriptors,
+    /// refresh modified title memory across submissions, copy bindless UAV
+    /// writes back to title memory, and map null/invalid addresses safely to 0.
+    #[test]
+    fn bindless_slots_materialize_refresh_and_copy_back_on_gpu() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (title_heap, base) = make_shader_heap(16);
+        let slot_handle = |i: u64| base + i * 32;
+
+        // Backing title memory (64 KiB aligned).
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let mem_base = mem.address();
+        let srv_addr = mem_base;
+        let cbv_16b_addr = mem_base + 0x30; // 16B-aligned, NOT 256B-aligned!
+        let copy_srv_addr = mem_base + 0x1000;
+        let uav_addr = mem_base + 0x2000;
+        let placed_tex_addr = mem_base + (64 << 10);
+
+        let srv_res = make_title_buffer(srv_addr, 256, false);
+        let copy_srv_res = make_title_buffer(copy_srv_addr, 256, false);
+        let uav_res = make_title_buffer(uav_addr, 256, true);
+
+        // Initial CPU data in title memory.
+        // SAFETY: offsets lie within the 256 KiB allocation `mem`.
+        unsafe {
+            (srv_addr as *mut u32).write(13);
+            (cbv_16b_addr as *mut [u32; 4]).write([10, 20, 30, 40]);
+            (copy_srv_addr as *mut u32).write(0xCAFE_1234);
+            (uav_addr as *mut [u32; 8]).write([0; 8]);
+            // First pixel of linear 4x4 RGBA8 placed texture at `placed_tex_addr`.
+            (placed_tex_addr as *mut [u8; 4]).write([0x12, 0x34, 0x56, 0x78]);
+        }
+
+        // Raw ByteAddressBuffer SRV/UAV descriptions in host D3D12 layout.
+        let srv_desc_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let uav_desc_host = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: both D3D12 view descriptions are 40-byte POD values (`[u32; 10]`).
+        let (raw_srv_words, raw_uav_words): ([u32; 10], [u32; 10]) = unsafe {
+            (
+                std::ptr::from_ref(&srv_desc_host)
+                    .cast::<[u32; 10]>()
+                    .read(),
+                std::ptr::from_ref(&uav_desc_host)
+                    .cast::<[u32; 10]>()
+                    .read(),
+            )
+        };
+
+        // Slot 0: Buffer SRV.
+        create_srv(std::ptr::null(), srv_res, &raw_srv_words, slot_handle(0));
+        // Slot 1: 16B-aligned CBV (size 64 bytes, address % 256 == 0x30).
+        create_cbv(
+            std::ptr::null(),
+            &[cbv_16b_addr as u32, (cbv_16b_addr >> 32) as u32, 64, 0],
+            slot_handle(1),
+        );
+        // Slot 2: Placed 4x4 R8G8B8A8_UNORM linear texture (`layout = 0x100`).
+        let placed_res_words: [u32; 14] = [
+            3, // TEXTURE2D
+            0,
+            0,
+            0,
+            4,
+            0,
+            4,
+            0x0001_0001,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            1,
+            0,
+            0x100, // console LINEAR layout
+            0,
+            0,
+        ];
+        let tex_srv_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let mut placed_view_words = [0u32; 16];
+        // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+        placed_view_words[..10].copy_from_slice(&unsafe {
+            std::ptr::from_ref(&tex_srv_host).cast::<[u32; 10]>().read()
+        });
+        placed_view_words[10] = placed_tex_addr as u32;
+        placed_view_words[11] = (placed_tex_addr >> 32) as u32;
+        create_placed_srv(
+            std::ptr::null(),
+            &placed_res_words,
+            &placed_view_words,
+            slot_handle(2),
+        );
+        // Slot 3: Buffer UAV.
+        create_uav(
+            std::ptr::null(),
+            uav_res,
+            std::ptr::null(),
+            &raw_uav_words,
+            slot_handle(3),
+        );
+        // Slot 6 -> copied to Slot 4 via `copy_simple`.
+        create_srv(
+            std::ptr::null(),
+            copy_srv_res,
+            &raw_srv_words,
+            slot_handle(6),
+        );
+        copy_simple(std::ptr::null(), 1, slot_handle(4), slot_handle(6), 0);
+        // Slot 5: Unmapped/null CBV (address = 0) -> must read 0 safely.
+        create_cbv(std::ptr::null(), &[0, 0, 256, 0], slot_handle(5));
+
+                let host_heap = heap(title_heap).host_arc().unwrap();
+        // Before bindless preparation, `mirror(..., false)` deferred all
+        // `View::is_buffer()` slots (`made[idx] == 0`).
+        for idx in 0..=5 {
+            assert_eq!(
+                host_heap.made.lock().unwrap()[idx],
+                0,
+                "slot {idx} starts deferred"
+            );
+        }
+
+        let (root, pso) = compile_probe_cs(&host.device);
+        let list = host.new_list().unwrap();
+
+        let record_probe = |list: &crate::host::HostList| {
+            host_heap.prepare_bindless_record(list);
+            list.defer_bindless(&host_heap, true);
+            // SAFETY: open command list, shader-visible heap, and matching root/PSO.
+            unsafe {
+                let gpu_start = host_heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+                let gpu_at = |slot_idx: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu_start + u64::from(slot_idx) * u64::from(host_heap.step),
+                };
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, gpu_at(0));
+                list.list.SetComputeRootDescriptorTable(1, gpu_at(1));
+                list.list.SetComputeRootDescriptorTable(2, gpu_at(2));
+                list.list.SetComputeRootDescriptorTable(3, gpu_at(3));
+                list.list.SetComputeRootDescriptorTable(4, gpu_at(4));
+                list.list.SetComputeRootDescriptorTable(5, gpu_at(5));
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+
+        record_probe(&list);
+        host.execute(&[&list]);
+        list.reset();
+
+        // SAFETY: GPU finished and `Host::execute` copied UAV writes back to `uav_addr`.
+        let out1 = unsafe { (uav_addr as *const [u32; 5]).read_volatile() };
+        assert_eq!(
+            out1[0], 13,
+            "bindless buffer SRV materialized and refreshed"
+        );
+        assert_eq!(
+            out1[1], 100,
+            "16B-aligned bindless CBV materialized via bounce"
+        );
+        assert_eq!(
+            out1[2], 0x7856_3412,
+            "placed streamed texture uploaded and sampled"
+        );
+        assert_eq!(out1[3], 0xCAFE_1234, "copied bindless SRV materialized");
+        assert_eq!(out1[4], 0, "null-address CBV safely reads zero");
+
+        // Modify CPU memory for both the SRV buffer and the 16B-aligned CBV,
+        // overwrite slot 5 with a `u64::MAX` garbage address CBV, and release
+        // `copy_srv_res` so slot 4 goes stale -> both slots 4 and 5 read 0!
+        create_cbv(
+            std::ptr::null(),
+            &[u32::MAX, u32::MAX, 256, 0],
+            slot_handle(5),
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(copy_srv_res), 0);
+        // SAFETY: offsets lie within `mem`.
+        unsafe {
+            (srv_addr as *mut u32).write_volatile(500);
+            (cbv_16b_addr as *mut [u32; 4]).write_volatile([100, 200, 300, 400]);
+        }
+
+        // Released views are looked for once a frame.
+        crate::queue::pass_frame();
+        record_probe(&list);
+        host.execute(&[&list]);
+        list.reset();
+
+        // SAFETY: GPU finished and copied back.
+        let out2 = unsafe { (uav_addr as *const [u32; 5]).read_volatile() };
+        assert_eq!(
+            out2[0], 500,
+            "dirty SRV title memory refreshed on second submit"
+        );
+        assert_eq!(
+            out2[1], 1000,
+            "dirty 16B-aligned CBV refreshed on second submit"
+        );
+        assert_eq!(out2[3], 0, "released resource slot pruned and reads zero");
+        assert_eq!(
+            out2[4], 0,
+            "overflowing u64::MAX garbage address safely reads zero"
+        );
+
+        assert_eq!(release(srv_res), 0);
+        assert_eq!(release(uav_res), 0);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// Submissions with nothing changed reuse a heap's bindless plan (no
+    /// slot is made or range found again); writing a slot makes a new one,
+    /// whose reads of one host copy are merged into one range.
+    #[test]
+    fn bindless_plan_is_remade_only_when_slots_change() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let cbv = |at: u64, slot: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                base + slot * 32,
+            );
+        };
+        cbv(mem.address(), 0);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let first = host_heap.bindless_plan().unwrap();
+        assert_eq!(first.reads.len(), 1);
+        assert_eq!(first.reads[0].2, 256);
+        assert!(first.writes.is_empty(), "constant buffers are not written");
+        // Other tests may release resources meanwhile, which remakes plans.
+        let reused = (0..100).any(|_| {
+            let a = host_heap.bindless_plan().unwrap();
+            Arc::ptr_eq(&a, &host_heap.bindless_plan().unwrap())
+        });
+        assert!(reused, "unchanged slots reuse the plan");
+
+        // Slot 0 marked unmade: were it made again, it would be made anew.
+        host_heap.made.lock().unwrap()[0] = 0;
+        cbv(mem.address() + 0x1000, 1);
+        let second = host_heap.bindless_plan().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a written slot remakes the plan"
+        );
+        assert_eq!(second.reads.len(), 1, "nearby reads merge");
+        assert_eq!(second.reads[0].1, mem.address() as usize);
+        assert_eq!(second.reads[0].2, 0x1100);
+        assert_eq!(
+            host_heap.made.lock().unwrap()[0],
+            0,
+            "only the written slot is made again"
+        );
+        assert_ne!(host_heap.made.lock().unwrap()[1], 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// Placed textures reached through slots upload the first time, then
+    /// only after [`RECHECK_FRAMES`] (a few per frame), or when another
+    /// texture takes the object's address.
+    #[test]
+    fn bindless_texture_uploads_are_throttled() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        let tex = 0x1000 as crate::object::This;
+        assert!(heap.upload_due(tex, &a, 10), "first reach uploads");
+        assert!(!heap.upload_due(tex, &a, 10));
+        assert!(!heap.upload_due(tex, &a, 10 + RECHECK_FRAMES - 1));
+        assert!(heap.upload_due(tex, &b, 11), "a new texture at the address");
+        assert!(heap.upload_due(tex, &b, 11 + RECHECK_FRAMES), "looked at again");
+        // At most `RECHECKS` known textures per frame.
+        let frame = 1000;
+        let many: Vec<_> = (0..2 * RECHECKS as usize)
+            .map(|i| {
+                let t = (0x2000 + i) as crate::object::This;
+                assert!(heap.upload_due(t, &a, 0));
+                t
+            })
+            .collect();
+        let again = many.iter().filter(|&&t| heap.upload_due(t, &a, frame)).count();
+        assert_eq!(again, RECHECKS as usize);
+    }
+
+    /// A list queues each heap once, keeping whether any draw may write.
+    #[test]
+    fn bindless_heaps_queue_once_per_list() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (title_heap, _) = make_shader_heap(8);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let list = host.new_list().unwrap();
+        list.defer_bindless(&host_heap, false);
+        list.defer_bindless(&host_heap, true);
+        list.defer_bindless(&host_heap, false);
+        assert_eq!(list.bindless_queued(), vec![true]);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.bindless_queued().is_empty());
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// Verifies `PLACED_TEXTURES` entries overlapping a remapped virtual range
+    /// are evicted on `title_memory_remapped` while non-overlapping entries stay.
+    #[test]
+    fn placed_textures_evict_on_title_memory_remapped() {
+        if host().is_none() {
+            return;
+        }
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let addr_a = mem.address();
+        let addr_b = mem.address() + (128 << 10);
+        let desc: [u32; 14] = [
+            3, // TEXTURE2D
+            0,
+            0,
+            0,
+            16,
+            0,
+            16,
+            0x0001_0001,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            1,
+            0,
+            0x100, // LINEAR
+            0,
+            0,
+        ];
+
+        assert!(crate::resource::texture_at(addr_a, &desc, 0).is_some());
+        assert!(crate::resource::texture_at(addr_b, &desc, 0).is_some());
+        assert!(crate::resource::has_placed_texture(addr_a, &desc));
+        assert!(crate::resource::has_placed_texture(addr_b, &desc));
+
+        let epoch_before = crate::resource::placed_epoch();
+        // Remap 256 bytes inside `addr_a`'s footprint (not even starting at `addr_a`!).
+        crate::watch::title_memory_remapped((addr_a + 128) as usize, 256);
+
+        assert!(
+            !crate::resource::has_placed_texture(addr_a, &desc),
+            "overlapping placed texture must be evicted"
+        );
+        assert!(
+            crate::resource::has_placed_texture(addr_b, &desc),
+            "non-overlapping placed texture must remain cached"
+        );
+        assert!(crate::resource::placed_epoch() > epoch_before);
+
+        // Clean up `addr_b` too.
+        crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
+        assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    #[test]
+    fn discarded_dynamic_ranges_unpin_only_their_own_resources() {
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let (buffer, _) = host.upload_buffer(256).unwrap();
+        heap.set_texture_pressure(true);
+        let first = heap.dynamic(3).unwrap();
+        for index in [1, first, first + 1, first + 2] {
+            heap.raw_at(index, &buffer, 0, 256);
+        }
+        heap.release(heap.id(), first, 2, true);
+        heap.release(heap.id(), first + 2, 1, false); // the synchronous list can still replay
+        let kept_at =
+            |index: u32| heap.kept[(index % KEPT_PIECES) as usize].lock().unwrap()[(index / KEPT_PIECES) as usize].is_some();
+        assert!(kept_at(1));
+        assert!(!kept_at(first) && !kept_at(first + 1));
+        assert!(kept_at(first + 2));
+    }
+
+    #[test]
+    fn changed_mip_views_can_use_resident_textures_under_pressure() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        static GUEST_BYTES: [u8; 65536] = [0; 65536];
+        let address = GUEST_BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 32, 0, 32, 0x3_0001, 28, 1, 0, 0x105, 0, 0];
+        let mut desc = [0; 16];
+        desc[0] = 28;
+        desc[1] = 4;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[5] = 1;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        assert!(resident_sampled_texture(&View::Placed(false, resource, desc)).is_none());
+        assert!(crate::resource::placed_known(address, &resource).is_none());
+        let texture = crate::resource::texture_at(address, &resource, 0).unwrap();
+        let heap = HostHeap::new(false, 4).unwrap();
+        let record = |view: View| {
+            let [index, generation] = super::super::words_for(view);
+            [VIEW_TAG, index, generation, 0]
+        };
+        let original = crate::resource::host_copy(texture).unwrap();
+        desc[4] = 1;
+        let placed = resident_sampled_texture(&View::Placed(false, resource, desc)).unwrap();
+        let object = resident_sampled_texture(&View::Shader(texture as usize, None)).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original, &placed._gpu));
+        assert!(std::sync::Arc::ptr_eq(&original, &object._gpu));
+        let view = View::Placed(false, resource, desc);
+        let words = record(view.clone());
+        heap.queue_texture(2, true, false, 1);
+        let write = heap.textures.lock().unwrap().slots[&2].write;
+        let (mirrored, held) = heap.mirror_queued(2, words.as_ptr() as u64, write, true).unwrap();
+        assert_eq!(mirrored, Some(view));
+        assert!(std::sync::Arc::ptr_eq(&original, &held.unwrap()._gpu));
+        let mut other = resource;
+        other[4] *= 2;
+        let unavailable = record(View::Placed(false, other, desc));
+        assert!(
+            heap.mirror_queued(2, unavailable.as_ptr() as u64, write, true)
+                .is_err()
+        );
+        assert!(crate::resource::placed_known(address, &other).is_none());
+        assert!(device_removed().is_none());
+    }
+
+    #[test]
+    fn a_26_slot_table_can_grow_into_the_unused_host_heap() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert!(heap.dynamic > DYNAMIC + 26);
+        assert_eq!(heap.dynamic(DYNAMIC - 12), Some(4));
+        assert_eq!(heap.dynamic(26), Some(4 + DYNAMIC - 12));
+        assert_eq!(heap.dynamic(1), Some(4 + DYNAMIC + 14));
+        heap.release(heap.id(), 4 + DYNAMIC - 12, 26, true);
+        heap.release(heap.id(), 4, DYNAMIC - 12, true);
+        heap.release(heap.id(), 4 + DYNAMIC + 14, 1, true);
+        assert_eq!(heap.dynamic(heap.dynamic), Some(4));
+        assert!(heap.dynamic(1).is_none());
+    }
+
+    /// A free run of dynamic slots that crosses the search cursor is found:
+    /// after the end, the search starts again from the start and goes on
+    /// `n - 1` slots past the cursor.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Every slot taken.
+        assert_eq!(heap.dynamic(heap.dynamic), Some(4));
+        // Dynamic slots 10..30 free, then 10..20 taken again: the cursor
+        // stops at 20, inside the free run, and 10..20 is given back.
+        heap.release(heap.id(), 4 + 10, 20, true);
+        assert_eq!(heap.dynamic(10), Some(4 + 10));
+        heap.release(heap.id(), 4 + 10, 10, true);
+        // From the cursor on only 20..30 is free (10 slots): a run of 15 has
+        // to start before the cursor and cross it. Searching the start only
+        // up to the cursor found 10 slots and gave none.
+        assert_eq!(heap.dynamic(15), Some(4 + 10));
+    }
+}
+
+
+#[cfg(test)]
+mod record_print_tests {
+    use super::record_print;
+
+    /// Equal records print alike; a record that differs in any one byte,
+    /// or in its length, prints otherwise.
+    #[test]
+    fn a_record_that_changed_prints_otherwise() {
+        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
+        let print = record_print(&record);
+        assert_eq!(print, record_print(&record.clone()));
+        for at in 0..32 {
+            for bit in 0..8 {
+                let mut other = record.clone();
+                other[at] ^= 1 << bit;
+                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
+            }
+        }
+        assert_ne!(record_print(&record[..16]), print);
+        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
+        // A record of zeros is told from "never looked at" by the caller's `| 1`.
+        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
+    }

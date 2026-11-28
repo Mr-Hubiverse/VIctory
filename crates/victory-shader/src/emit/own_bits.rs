@@ -766,12 +766,6 @@ pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
                 }
                 match ctx.site(b, t, x, mask) {
                     Ok(alike) => {
-                        if why {
-                            eprintln!(
-                                "WAVE64-OWN-BITS the wave OR at {:#x}: total {t:?} alike {alike:?}",
-                                p.blocks[b].insts[s].machine.offset
-                            );
-                        }
                         out.totals.insert(t);
                         out.alike.extend(alike);
                     }

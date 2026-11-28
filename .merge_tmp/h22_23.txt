@@ -1,0 +1,135 @@
+OURS22:
+        g.absent.remove(&block);
+        g.verified.remove(&block);
+        forget_hole(&mut g, block);
+    }
+    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let had_protected = !blocks.is_empty();
+    for block in blocks {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        // A view mapped a moment ago may already have been made read-only
+        // as another view of a guarded page (between the runtime's
+        // `title_memory_view` and this call): it is given back, or the
+        // title's next write there would fault with no guard to answer
+        // for it.
+        let mut old = 0;
+        // SAFETY: only the protection of title view memory changes; the
+        // call fails harmlessly on memory that is no longer a view.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                (block * BLOCK) as *const _,
+                BLOCK,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                &mut old,
+            )
+        };
+        // What it shows is new ([`PUBLISHED`]).
+        PUBLISHED.clear(block);
+
+THEIRS22:
+        g.absent.remove(block);
+        if g.held.remove(block) {
+            PUBLISHED.clear(block);
+        }
+    }
+    let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
+    for block in foreign {
+        g.foreign.remove(&block);
+
+OURS23:
+    if view_known() {
+        // The runtime calls this for two things only (`xmem`: `map` and
+        // `unmap`): a range it has just mapped a section's pages into,
+        // and a view it is about to make a placeholder again. Either way
+        // what stands there is view memory or a hole in it, which is what
+        // `is_view` would answer for a range that begins there; and the
+        // write watch's asking can only fail there. The title remaps some
+        // 83 times a frame, and each time the blocks were forgotten, so
+        // that the next asking about each range went to the kernel twice
+        // (run 235: 266 to 565 failed askings a frame with the blocks
+        // remembered from their guards alone, no fewer than without).
+        g.viewed.extend(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK));
+        return;
+    }
+    // What the range shows is new: no longer known to be a view.
+    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in viewed {
+        g.viewed.remove(&block);
+    }
+    let end = at.saturating_add(len);
+    let holes: Vec<usize> = g
+        .holes
+        .range(at / BLOCK..end.div_ceil(BLOCK))
+        .copied()
+        .collect();
+    let changed = had_protected || !holes.is_empty();
+    for block in holes {
+        g.holes.remove(&block);
+    }
+    if changed {
+        bump_region_epochs(at, end);
+    }
+    drop(g);
+    crate::shadow::remapped(at as u64, end as u64);
+    crate::resource::evict_placed_textures(at as u64, end as u64);
+    crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
+}
+
+/// The runtime wrote new contents into title memory `[at, at + len)` (a
+/// streamed file arrived): textures placed there are uploaded again at their
+/// next use, not when their turn to be looked at comes.
+pub fn title_memory_arrived(at: usize, len: usize) {
+    if len != 0 {
+        bump_region_epochs(at, at.saturating_add(len));
+        // The runtime writes through a view of its own, which neither the
+        // kernel's write watch nor our guards see: the pages are noted
+        // written here, or host copies of buffers made before the file
+        // arrived kept what the memory held then for good (meshes read as
+        // zeros: walls, floors and bodies missing, others each launch).
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.asked += 1;
+            let now = j.asked;
+            for page in at / PAGE..(at + len).div_ceil(PAGE) {
+                j.written.insert(page, now);
+            }
+        }
+        crate::resource::textures_rewritten(at as u64, (at + len) as u64);
+    }
+}
+
+/// Opens a guarded block at `at` (or returns `true` if another thread already
+/// made it read-write). Called both by our own VEH handler and by
+/// `host::safe_copy`'s VEH handler on write faults.
+pub(crate) fn try_open_guarded(at: usize) -> bool {
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
+    }
+    if writable(at) {
+        return true;
+    }
+    // Read-only, in a view we were told of, and not noted guarded: only we
+    // make title views read-only, so it is ours to give back.
+    if view_guard() && !aliases(at).is_empty() {
+        let mut old = 0;
+        let block = at - at % BLOCK;
+        // SAFETY: only the protection of title view memory changes.
+        let opened = unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                block as *const _,
+                BLOCK,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                &mut old,
+            )
+        } != 0;
+        if opened {
+            bump_region_epochs(block, block + BLOCK);
+            tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block that no guard knew was opened");
+        }
+        return opened;
+    }
+    false

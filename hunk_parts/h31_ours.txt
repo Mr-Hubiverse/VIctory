@@ -1,0 +1,9 @@
+        // made anew here, with the card full. `made` first, then `kept`,
+        // as `mirror` takes them.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+            && self.kept[(index % KEPT_PIECES) as usize]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get((index / KEPT_PIECES) as usize)
+                .is_some_and(Option::is_some)

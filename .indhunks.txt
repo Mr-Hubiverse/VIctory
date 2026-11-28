@@ -1,0 +1,326 @@
+########## crates/victory-gpu/src/indirect.rs
+=== hunk 0 ours 0b theirs 184b
+OURS:
+THEIRS://! The executions of one record without a count buffer (all the title's)
+//! are clamped in batches ([`batch`], `VICTORY_INDIRECT_BATCH`): the rest of
+//! this is for the others.
+//!
+
+=== hunk 1 ours 29b theirs 0b
+OURS:static const uint SPLIT = 2;
+
+THEIRS:
+=== hunk 2 ours 146b theirs 0b
+OURS:    bool counted_table = (has_count & 16u) != 0;
+    if (counted_table) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+
+THEIRS:
+=== hunk 3 ours 134b theirs 0b
+OURS:    bool spread = (has_count & 8u) != 0;
+    uint row = 0;
+    uint asked_x = 0;
+    if (spread) {
+        dst_at = id.x * 20u;
+    }
+
+THEIRS:
+=== hunk 4 ours 2196b theirs 918b
+OURS head:        uint count = min(want.x, 1u << 24);
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        // A record that asks for MOST_DRAW vertices or indices an instance
+        // or more is no draw of the ti
+OURS tail: rows);
+        } else {
+            g = min(raw, uint3(65535u, 65535u, 65535u));
+        }
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+
+THEIRS head:        // A record of MOST_DRAW vertices or indices an instance, or more, is
+        // no draw of the title's (a slot it has not filled): it runs empty
+        // and charges nothing (victory-fork f85101b6, its window checker
+        // found 90 of 2^24 vert
+THEIRS tail:EST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+
+=== hunk 5 ours 209b theirs 197b
+OURS:    if (active && kind >= 2) {
+        // Diagnostics, in the budget buffer's next words (below): the
+        // largest group count a mesh or compute record asked for, and the
+        // groups asked in all.
+
+THEIRS:    if (active && kind > 2) {
+        // Diagnostics, in the budget buffer's next words (below): the
+        // largest group count a mesh record asked for, and the groups
+        // asked in all.
+
+=== hunk 6 ours 41b theirs 40b
+OURS:    if (gi == 0 && kind >= 2 && n > 0) {
+
+THEIRS:    if (gi == 0 && kind > 2 && n > 0) {
+
+=== hunk 7 ours 526b theirs 1879b
+OURS head:/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage
+OURS tail:at is may differ from frame to frame. The frame
+/// line says how many records a frame are refused.
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+
+THEIRS head:/// The most groups in x that an indirect dispatch runs as the title asks:
+/// 65,535 is the most D3D12 names for a dispatch, 2^20 ([`SOURCE`]'s GROUPS)
+/// what is bounded here anyway (`VICTORY_INDIRECT_WIDE=0`: 65,535; a record
+/// that asks for more still r
+THEIRS tail:CT_REST=1`; off by default so one oversized record takes
+/// nothing and later valid draws still run).
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+
+=== hunk 8 ours 64b theirs 184b
+OURS:    let source = &format!("#define REST {}\n{source}", rest());
+
+THEIRS:    #[cfg(feature = "diagnostics")]
+    let batched = source == batch::SOURCE;
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+
+=== hunk 9 ours 86b theirs 78b
+OURS:    clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
+
+THEIRS:    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+
+=== hunk 10 ours 1205b theirs 79b
+OURS:    clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
+}
+
+/// The parts [`bound_split`] makes of a dispatch, the most groups of each,
+/// and the bytes between them.
+pub(crate) const SPLIT: u32 = 2;
+pub(crate) const PART: u32 = 65_535;
+pub(crate) const PART_BYTES: u64 = 12;
+
+/// [`bound`] for one dispatch that a program with a group base runs
+/// (`victory_shader::emit::USER_GROUP_BASE`): [`SPLIT`] records follow each
+/// other in the scratch buffer, of which the first has the first [`PART`]
+/// groups in x and the next the ones after (empty if there are none). The
+/// console runs 115,200 groups in one dispatch (the title's final
+/// gather of indirect light: 8 for each 16x16 tile of 2560x1440); clamped
+/// to what the host runs, the tiles at the bottom of the screen kept what
+/// they showed before.
+pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Option<ID3D12Resource> {
+    let spec = (2, 12, 1);
+    validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, false, true).then_some(dst)
+}
+
+
+THEIRS:    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+
+=== hunk 11 ours 188b theirs 154b
+OURS:    spread: bool,
+) -> bool {
+    let before = list.indirect_state(dst);
+    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread, true);
+
+THEIRS:) -> bool {
+    let before = list.indirect_state(dst);
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+
+=== hunk 12 ours 216b theirs 148b
+OURS:/// `INDIRECT_ARGUMENT`. `how`: [`AHEAD`], the records are a window clamped
+/// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
+/// parts ([`bound_split`]). False, with nothing recorded, if the
+
+THEIRS:/// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
+/// their draws ([`bound_ahead`]). False, with nothing recorded, if the
+
+=== hunk 13 ours 602b theirs 0b
+OURS:    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false, false)
+}
+
+/// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
+/// are spread across z, every record written as [row, asked x, x, y, z]
+/// (20 bytes) for `crate::draw`'s spread command signature.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+
+THEIRS:
+=== hunk 14 ours 7917b theirs 1504b
+OURS head:/// Records, into a list's prelude `l`, the passes that fill the scratch
+/// buffers of `sets` ([`gather`]), charged to the words of `budget`, which
+/// is zeroed first (the gathered records have a budget of their own: the
+/// list's own clamps zero and charge
+OURS tail:NDIRECT_ARGUMENT.
+    unsafe {
+        list.ResourceBarrier(&[transition(
+            scratch,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_COMMON,
+        )])
+
+THEIRS head:/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::
+THEIRS tail:t (dst, base, before) = list.batch_place()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: a live buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+
+=== hunk 15 ours 58b theirs 50b
+OURS:                warp.list.Dispatch(groups(PIECES), 1, 1);
+
+THEIRS:                warp.list.Dispatch(PIECES, 1, 1);
+
+=== hunk 16 ours 5889b theirs 55652b
+OURS head:    /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
+    /// adapter, in one list behind the compare as `Host::card_before`
+    /// records it: each flagged piece takes a ticket and, while it is
+    /// within the slots of the lowest t
+OURS tail:GHT_NONE, INFLIGHT_NONE]);
+        let mut piece0 = content[..PIECE - SKEW as usize].to_vec();
+        piece0[5] ^= 1;
+        piece0[9] ^= 2;
+        assert_eq!(slot(PIECE - SKEW as usize), piece0);
+
+THEIRS head:    /// What the passes over copies in the card's memory cost on the card
+    /// (ignored: a measurement): rounds of a few passes of some pieces and a
+    /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
+    /// source of the shader.
+   
+THEIRS tail: waits for what was sent.
+            unsafe {
+                let _ = gpu.fence.SetEventOnCompletion(sent, gpu.event);
+                WaitForSingleObject(gpu.event, 10_000);
+            }
+        }
+
+=== hunk 17 ours 171b theirs 240b
+OURS:                if i == 0 { 1 << 24 } else { 1 << 22 }, // IndexCount
+                if i == 0 { 1 } else { u32::MAX }, // InstanceCount -> clamps to 16 (cost = 1 << 26)
+
+THEIRS:                // The last is no draw: empty, and free.
+                if i + 1 < RECORDS as usize { 1 << 22 } else { 1 << 23 }, // IndexCount
+                u32::MAX,                    // InstanceCount -> clamps to 16 (cost = 1 << 26)
+
+=== hunk 18 ours 410b theirs 27b
+OURS:                // WHICH two draws keep the budget is the order the card
+                // runs the threads in, which nothing fixes (the software
+                // device gave another two in five runs of seven): only how
+                // many is the clamp's to say, below.
+                assert_ne!(i, 0, "the record that is no draw charges nothing and is not kept as one");
+                kept.push(i);
+
+THEIRS:                kept += 1;
+
+=== hunk 19 ours 98b theirs 91b
+OURS:        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false).unwrap();
+
+THEIRS:        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+
+=== hunk 20 ours 100b theirs 93b
+OURS:        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false).unwrap();
+
+THEIRS:        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+
+=== hunk 21 ours 100b theirs 93b
+OURS:        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false).unwrap();
+
+THEIRS:        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+
+=== hunk 22 ours 100b theirs 93b
+OURS:        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false).unwrap();
+
+THEIRS:        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+
+=== hunk 23 ours 97b theirs 88b
+OURS:        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+
+THEIRS:        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+
+=== hunk 24 ours 190b theirs 176b
+OURS:            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), false).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
+
+THEIRS:            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+
+=== hunk 25 ours 99b theirs 92b
+OURS:        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
+
+THEIRS:        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+
+=== hunk 26 ours 2837b theirs 0b
+OURS head:    /// The window check: a record nothing wrote since its window clamped
+    /// it compares equal; one written on the card after the window's clamp
+    /// (an untracked writer) is found, and named as the window had it and
+    /// as it is now.
+    #[test]
+ 
+OURS tail:iffered), (2, 1), "two checks, the written record differs");
+        assert_eq!(window[..3], [5, 1, 1], "as the window clamped it");
+        assert_eq!(fresh[..3], [11, 2, 1], "as it is now");
+    }
+
+
+THEIRS head:
+THEIRS tail:
+=== hunk 27 ours 0b theirs 1460b
+OURS:
+THEIRS:
+    /// A command signature of one argument of `kind` on `device`.
+    fn one_argument(device: &ID3D12Device, kind: u32, stride: u32) -> ID3D12CommandSignature {
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a valid single-argument command signature description.
+        unsafe {
+            device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+        }
+        sig.unwrap()
+    }
+
+    /// An AMD card runs every group of an indirect dispatch of more than
+    /// 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    #[test]
+    fn card_runs_wide_indirect_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+

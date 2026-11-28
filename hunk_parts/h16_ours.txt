@@ -1,0 +1,28 @@
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the feature query fills this structure.
+        let tier = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .is_ok()
+        .then_some(caps.ResourceBindingTier);
+        let mut limits = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query fills this structure on runtimes that support it.
+        let max_views = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut limits).cast(),
+                size_of_val(&limits) as u32,
+            )
+        }
+        .is_ok()
+        .then_some(limits.MaxViewDescriptorHeapSize)
+        .filter(|&count| count >= PORTABLE_VIEWS);
+        let views = view_heap_size(tier, max_views, fits);
+        tracing::info!(
+            views,
+            binding_tier = ?tier,
+            ?max_views,

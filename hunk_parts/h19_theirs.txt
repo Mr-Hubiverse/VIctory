@@ -1,0 +1,3 @@
+        let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let (heap, count, size) = if null == 0 {

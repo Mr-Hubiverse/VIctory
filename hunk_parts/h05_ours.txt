@@ -1,0 +1,7 @@
+    /// Lazily-built table of slot count + title address per buffer/RTAS
+    /// slot, for shaders that read a descriptor table as a scalar load.
+    addresses: std::sync::OnceLock<(ID3D12Resource, usize)>,
+    /// Runs grow geometrically. Older reservations stay valid until this
+    /// heap is destroyed because recorded command lists still use their base.
+    raw_pages: Mutex<Option<RawPageRun>>,
+    buffers: Mutex<BufferSlots>,

@@ -1,0 +1,485 @@
+########## crates/victory-gpu/src/texture.rs
+=== hunk 0 ours 92b theirs 192b
+OURS:    /// Its part of the buffer, if that is shared.
+    _slot: Option<crate::texpool::Slot>,
+
+THEIRS:    /// Where in `buffer` it begins (the footprints count from there).
+    base: u64,
+    /// Back in the pool with the last list that names it.
+    _piece: Option<crate::pool::StagingPiece>,
+
+=== hunk 1 ours 232b theirs 609b
+OURS:    /// Mips per array slice, and the title's larger ones left out.
+    mips: u32,
+    /// The first of them that is uploaded, and the bytes of title memory
+    /// read for it and the smaller ones.
+    first: u32,
+    size: usize,
+
+THEIRS:    /// Mips per array slice, of the title's texture.
+    mips: u32,
+    /// The first of them that is read and uploaded
+    /// (`crate::resource::held_only`), the one the host copy begins at, and
+    /// the bytes of title memory read.
+    first: u32,
+    level0: u32,
+    read: usize,
+    /// Which host copy it uploads into, and what that is told to hold.
+    serial: u64,
+    holds: Arc<crate::resource::Holds>,
+    /// Made by the pass over textures picked by index, for one upload
+    /// ([`once`]): read when the list is submitted, and never looked at again.
+    once: std::sync::atomic::AtomicBool,
+
+=== hunk 2 ours 4882b theirs 312b
+OURS head:    /// The runtime wrote the memory since it was last looked at.
+    rewritten: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    gpu_uploads: std::sync::atomic::AtomicU64,
+    /// The size of the buffer if it came from the pool of spare staging
+    /// buf
+OURS tail:4> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
+
+THEIRS head:    /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
+    /// refresh must wait for title memory to stop remapping
+    /// (`title_memory_reading`) instead of taking `no_wait()` /
+    /// `refresh_unlocked()` or the 30-frame partial-read 
+THEIRS tail:memory to stop remapping
+    /// (`title_memory_reading`) instead of taking `no_wait()` /
+    /// `refresh_unlocked()` or the 30-frame partial-read throttle.
+    exact: std::sync::atomic::AtomicBool,
+
+=== hunk 3 ours 298b theirs 1412b
+OURS:    /// The texture was found changed without a write the guard saw
+    /// ([`Staging::unseen_write`]): it is hashed at every check until this
+    /// frame.
+    unguarded: u64,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
+
+THEIRS:    /// Until this frame a guarded texture is hashed at every check: its
+    /// first checks, and after the hash found a change the guard had not
+    /// seen ([`hot_textures`]). 0: not checked under the guard yet.
+    hot_until: u64,
+}
+
+/// Frames a guarded texture is hashed at every check from its first check,
+/// and after the hash found a change the guard did not see.
+const HOT_FRAMES: u64 = 64;
+
+/// Whether a guarded texture whose memory the hash found changed although
+/// the guard saw no write is hashed at every check for a while
+/// ([`HOT_FRAMES`]), not every eighth frame. A title that writes such a
+/// texture through another view of its pages (the guard sees none of it)
+/// every frame, a video's frames in a ring of three, showed each one up
+/// to eight frames late and in turns: the boot logo video and the loading
+/// animation flickered between old and new pictures (fx-flicker run 1441:
+/// the presented picture cycled through three, a new one every eight
+/// frames). A texture also starts hot, for the ones written that way from
+/// the start (the six-star screen of the first seconds, which the hash
+/// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
+/// only, as before.
+fn hot_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+
+=== hunk 4 ours 91b theirs 74b
+OURS:    let idle_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
+
+THEIRS:    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+
+=== hunk 5 ours 440b theirs 4671b
+OURS head:#[allow(dead_code)]
+/// Textures a bindless slot began to view, to upload before anything of the
+/// next submission runs: every list reads the slot, not only the one whose
+/// recording made it.
+static FIRST: Mutex<Vec<(Arc<Staging>, Arc<crate::resource::Host
+OURS tail:rate::resource::HostTexture>)>> = Mutex::new(Vec::new());
+
+#[allow(dead_code)]
+/// A bindless slot views `resource` from now on.
+pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
+
+THEIRS head:/// Records, once per list, the copy of `resource`'s staging buffer into
+/// its host copy, and the detiling that refreshes the staging buffer at
+/// submission if the memory changed. Leaves the texture in the copy
+/// destination state.
+pub(crate) fn upload(l
+THEIRS tail:::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
+    let first = if crate::resource::held_only() { first } else { 0 };
+
+=== hunk 6 ours 1633b theirs 527b
+OURS head:    if host_written {
+        return;
+    }
+    if let Some(copy) = crate::resource::host_copy(resource)
+        && let Some(staging) = staging(resource, texture, 0)
+    {
+        FIRST.lock().unwrap_or_else(|e| e.into_inner()).push((staging, copy));
+    }
+}
+
+
+OURS tail:resource) <= first
+    {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    let Some(staging) = staging(resource, texture, first) else {
+
+THEIRS head:    // shortcut: a texture the host copied into keeps the host's contents
+    // even if the title later writes its memory too.
+    if host_written {
+        return;
+    }
+    // Once a list for each first level; not again for one that the list's
+    // upload
+THEIRS tail:e, first)) {
+        return;
+    }
+    if !list.first_use(resource as usize) && staged_from(resource) <= first {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+
+=== hunk 7 ours 547b theirs 1136b
+OURS:    crate::framelog::add(crate::framelog::T::Uploads, 1);
+    // Once per submission however many of its lists sample the texture;
+    // `copy` keeps the host texture alive even if the title releases it
+    // before submission, and `CopyTextureRegion` is recorded onto the
+    // prelude when `staging.refresh()` reports dirty contents.
+    list.defer_texture(staging.clone(), copy.clone());
+    let set = staging.clone();
+    list.defer_host(move || {
+        set.uploaded.store(true, Relaxed);
+        set.dirty.store(false, Relaxed);
+    });
+
+THEIRS:    if no_wait() && fill_unlocked() {
+        let there = match picking {
+            Some(there) if there != u64::MAX => there,
+            _ => mapped_bytes(staging.memory, staging.read),
+        };
+        staging.expected.store(there, Relaxed);
+    }
+    record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
+    // When the list is submitted, its copy takes what the staging buffer
+    // holds by then: noted before the check below, which sets `dirty`
+    // again if it detiles (the next list then uploads once more).
+    {
+        let staging = staging.clone();
+        list.defer_host(move || {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+        });
+    }
+    // A host copy that took the place of one with fewer levels: the slots
+    // that show that one are made again once this upload has run.
+    if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
+        let start = staging.memory as u64;
+        list.defer_host(move || crate::descriptor::host::levels_changed_after(start));
+    }
+    let noted = staging.clone();
+
+=== hunk 8 ours 571b theirs 11607b
+OURS head:        list.defer_texture(staging, copy);
+        return;
+    };
+    list.defer_texture(staging.clone(), copy);
+    list.defer_host(move || {
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        staging.waiti
+OURS tail: has no staging buffer after this
+        // upload: its slots are made due again by the texture pass.
+        if waiting {
+            crate::descriptor::host::levels_waiting(staging.memory as u64);
+
+THEIRS head:        list.defer_texture(staging);
+        // Then what the list's copy puts in the host copy is known.
+        list.defer_host(move || noted.note_held());
+        return;
+    };
+    list.defer_texture(staging.clone());
+    list.defer_host(move || {
+        
+THEIRS tail:se);
+        if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
+            out.fill(0);
+            once!("could not copy the linear plane into the list's upload buffer: {error:?}");
+
+=== hunk 9 ours 126b theirs 137b
+OURS:        (self.memory as usize, self.size)
+    }
+
+    /// The mip and the array slice of the `i`th part of the staging buffer.
+
+THEIRS:        (self.memory as usize, self.read)
+    }
+
+    /// The title's level and the array slice of the staging buffer's part
+    /// `i`.
+
+=== hunk 10 ours 217b theirs 297b
+OURS:    #[allow(dead_code)]
+    /// The texture's subresource the `i`th part of the staging buffer is.
+    fn subresource(&self, i: usize) -> u32 {
+        let (mip, slice) = self.part(i);
+        slice * self.mips + mip
+
+THEIRS:    /// The host copy holds what the staging buffer was filled from
+    /// ([`unchanged`]).
+    fn note_held(&self) {
+        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+
+=== hunk 11 ours 48b theirs 108b
+OURS:        let (read, dirty) = self.refresh_now();
+
+THEIRS:        let _texture = crate::timeline::span("a texture's refresh");
+        let read = self.refresh_now();
+
+=== hunk 12 ours 84b theirs 632b
+OURS:    /// Returns `(bytes_read, dirty)`.
+    fn refresh_now(&self) -> (usize, bool) {
+
+THEIRS:    fn movie_plane(&self) -> bool {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+        let desc = &self.layout.desc;
+        !self.on_demand
+            && desc.dimension == victory_formats::texture::Dimension::Tex2d
+            && desc.swizzle.0 == 0
+            && desc.depth == 1
+            && desc.mips == 1
+            && desc.samples == 1
+            && self.footprints.len() == 1
+            && self.footprints[0].Offset == 0
+            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
+    }
+
+    /// Returns the bytes of title memory read.
+    fn refresh_now(&self) -> usize {
+
+=== hunk 13 ours 30b theirs 30b
+OURS:        let size = self.size;
+
+THEIRS:        let size = self.read;
+
+=== hunk 14 ours 485b theirs 231b
+OURS:        // A texture that changed without the guard seeing it is hashed at
+        // every check for a while (the intro's movie: three pictures in turn
+        // that only changed every eighth frame, one old picture after
+        // another on the screen).
+        let rewritten = self.rewritten.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let mut unseen = rewritten;
+        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+
+THEIRS:        // The guard saw no write: a change the hash finds came another way.
+        let mut blind = false;
+        if !alone
+            && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+
+=== hunk 15 ours 542b theirs 561b
+OURS:            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
+            // Linear pictures of one level are what the processor draws (the
+            // planes of a movie), through a view of its own.
+            let desc = &self.layout.desc;
+            let film = desc.swizzle.0 == 0 && desc.mips == 1;
+            if unwritten && !turn && !film && frame >= last.unguarded {
+                return 0;
+            }
+            unseen = unwritten;
+
+THEIRS:            let turn = frame
+                .wrapping_add((start >> 16) as u64)
+                .is_multiple_of(HASH_EVERY);
+            // A texture starts hot: one written that way from its first
+            // frames on changes before the hash has ever caught it.
+            if last.hot_until == 0 {
+                last.hot_until = frame + HOT_FRAMES;
+            }
+            let hot = hot_textures() && frame < last.hot_until;
+            if !exact && unwritten && !turn && !hot {
+                return 0;
+            }
+            blind = unwritten;
+
+=== hunk 16 ours 0b theirs 27b
+OURS:
+THEIRS:    let mut print = 0u128;
+
+=== hunk 17 ours 241b theirs 111b
+OURS:        let hash = hasher.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&hash.as_bytes()[..8]);
+        // 0 says "none" to the texture queue (`Recheck`, `checked`).
+        u64::from_le_bytes(first) | 1
+    })
+
+THEIRS:    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+
+=== hunk 18 ours 360b theirs 1081b
+OURS:    Some((s.size as u64, committed(s.memory, s.size)))
+}
+
+/// The first mip a title texture's staging buffer holds; `u32::MAX` without
+/// one.
+fn staged_from(resource: This) -> u32 {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .map_or(u32::MAX, |s| s.first)
+
+THEIRS:    let whole = !ask
+        || if *ALL.get_or_init(|| std::env::var_os("VICTORY_STAGED_ASK_ALL").is_some_and(|v| v == "1")) {
+            committed(s.memory, s.read)
+        } else {
+            !crate::resource::at_title_address(resource) || all_there(s.memory, s.read)
+        };
+    Some((s.read as u64, whole))
+}
+
+/// Whether all of `[at, at + len)` is mapped: by the runtime's views of
+/// physical pages where any lies there (as [`mapped_bytes`] asks), else by
+/// asking Windows ([`committed`]).
+fn all_there(at: *const u8, len: usize) -> bool {
+    match by_views().then(|| crate::inplace::shown_bytes(at as usize, len)).flatten() {
+        Some(there) => there >= len as u64,
+        None => committed(at, len),
+    }
+}
+
+/// Whether how much of title memory is mapped is asked of the runtime's
+/// views of physical pages first (`VICTORY_MAPPED_BY_VIEWS=0`: of Windows).
+fn by_views() -> bool {
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
+
+=== hunk 19 ours 22b theirs 481b
+OURS:    if start == end {
+
+THEIRS:    // Streamed textures lie in views of physical pages, of which the runtime
+    // knows which are there: one look, where the host was asked for every
+    // 64 KiB of the texture (and once more for each that is not there).
+    // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
+    if by_views()
+        && let Some(there) = crate::inplace::shown_bytes(start, len)
+    {
+        return there;
+    }
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+
+=== hunk 20 ours 806b theirs 196b
+OURS:/// The first mip a staging buffer holds and the bytes of title memory read
+/// for it and the smaller ones, for a texture of `mips` mips a view shows
+/// from `first` on: from `first` only where the layout can end behind the
+/// smaller mips (one 2-D slice: `bytes_from` is the whole layout for any
+/// other), else all of it.
+fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32) -> (u32, usize) {
+    let first = if first < mips && layout.bytes_from(first) < layout.size { first } else { 0 };
+    (first, layout.bytes_from(first) as usize)
+}
+
+/// The staging state of a title texture from mip `first` on, made on first
+/// use (and made anew for larger mips than the one there holds).
+fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+
+THEIRS:/// The staging state of a title texture, made on first use.
+fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    let texture = &copy.texture;
+
+=== hunk 21 ours 28b theirs 78b
+OURS:        && s.first <= first
+
+THEIRS:        && s.first <= first.max(copy.base)
+        && s.serial == copy.serial
+
+=== hunk 22 ours 77b theirs 212b
+OURS:    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+
+THEIRS:    let level0 = copy.base;
+    let mips = level0 + u32::from(d.MipLevels);
+    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
+    let read = layout.bytes_from(first) as usize;
+
+=== hunk 23 ours 71b theirs 55b
+OURS:        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+
+THEIRS:        (mips - first) * u32::from(d.DepthOrArraySize)
+
+=== hunk 24 ours 19b theirs 28b
+OURS:            first,
+
+THEIRS:            first - level0,
+
+=== hunk 25 ours 333b theirs 928b
+OURS:    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    crate::host::name_frame(&buffer, || {
+        format!(
+            "staging of {resource:?} {}x{}x{} f{}",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+        )
+    });
+    tracing::debug!(?d, total, "texture contents uploaded from title memory");
+
+THEIRS:    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
+        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+        None => {
+            let speculative = PICKING.get().is_some() && !BAKING.get();
+            if crate::residency::upload_refused()
+                || (speculative && !crate::residency::allow_staging_growth(false))
+            {
+                crate::residency::note_staging_deferred();
+                return None;
+            }
+            let (buffer, data) = host.upload_buffer(total)?;
+            crate::host::name(&buffer, || {
+                format!(
+                    "staging of {resource:?} {}x{}x{} f{}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                )
+            });
+            (None, buffer, 0, data)
+        }
+    };
+    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+
+=== hunk 26 ours 67b theirs 222b
+OURS:        mips: u32::from(d.MipLevels),
+        first,
+        size,
+
+THEIRS:        mips,
+        first,
+        level0,
+        read,
+        serial: copy.serial,
+        holds: copy.holds.clone(),
+        once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
+
+=== hunk 27 ours 54b theirs 128b
+OURS:        used: std::sync::atomic::AtomicU64::new(now),
+
+THEIRS:        used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        expected: std::sync::atomic::AtomicU64::new(0),
+
+=== hunk 28 ours 156b theirs 65b
+OURS:        _slot: None,
+        rewritten: Default::default(),
+        #[cfg(test)]
+        gpu_uploads: std::sync::atomic::AtomicU64::new(0),
+        pooled,
+
+THEIRS:        exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+

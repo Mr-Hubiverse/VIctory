@@ -5,11 +5,10 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-pub mod opt;
-
 use std::collections::HashMap;
 
 pub mod census;
+pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -56,7 +55,6 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -91,6 +89,7 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
+    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -109,14 +108,10 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
-    #[allow(dead_code)]
-    FpTrunc = 7,
-    FpExt = 8,
     Bitcast = 11,
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
-#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -167,8 +162,6 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
-    /// One of the type, per lane (a local array); the size constant.
-    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -228,12 +221,7 @@ pub(crate) struct Module {
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
-    /// The block each instruction went into, parallel with `insts`.
-    inst_block: Vec<u32>,
     blocks: Vec<Block>,
-    /// The merge of each split and the instruction count when it happened
-    /// ([`Module::close`]).
-    moved: HashMap<usize, (usize, u32)>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
@@ -249,47 +237,6 @@ impl Module {
         self.types.push(def.clone());
         self.type_ids.insert(def, t);
         Ty(t)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn uses_of(&self, target: V) -> usize {
-        let mut n = 0;
-        let mut count = |v: V| {
-            if v == target {
-                n += 1;
-            }
-        };
-        for inst in &self.insts {
-            match &inst.op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
-                    count(*a);
-                    count(*b);
-                }
-                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
-                Op::AtomicRmw(_, c, t) => {
-                    count(*c);
-                    count(*t);
-                }
-                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
-                    count(*c);
-                    count(*t);
-                    count(*f);
-                }
-                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
-                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
-                Op::Gep(_, base, idx) => {
-                    count(*base);
-                    idx.iter().for_each(|&v| count(v));
-                }
-                Op::Alloca(..) => {}
-            }
-        }
-        for block in &self.blocks {
-            if let Some(Term::CondBr(cond, _, _)) = block.term {
-                count(cond);
-            }
-        }
-        n
     }
 
     pub fn void(&mut self) -> Ty {
@@ -368,7 +315,6 @@ impl Module {
         self.constant(ty, Const::Aggregate(ids))
     }
 
-    #[allow(dead_code)]
     /// The value of an integer constant; `None` for anything else.
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
@@ -412,15 +358,9 @@ impl Module {
             ty,
             ptr,
             space,
-            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
-    }
-
-    pub fn align_global_to_eight(&mut self, global: V) {
-        let V::Global(n) = global else { unreachable!() };
-        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -451,20 +391,6 @@ impl Module {
         self.blocks.len() - 1
     }
 
-    #[allow(dead_code)]
-    /// The bits of an integer or float constant (integers as stored,
-    /// sign-extended).
-    pub fn known(&self, v: V) -> Option<i64> {
-        match v {
-            V::Const(i) => match self.consts[i as usize].1 {
-                Const::Int(x) => Some(x),
-                Const::Float(bits) => Some(i64::from(bits)),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -482,64 +408,11 @@ impl Module {
         }
     }
 
-    /// `at` was split into paths that merge at `into`. Code can hold `at`
-    /// across the split — a lane-mask exchange run lazily while an operand
-    /// resolves, say — and then emit into it. What those instructions read
-    /// decides where they go ([`Module::push`]): operands defined before the
-    /// split mean they belong before its branch, where they dominate the
-    /// most; an operand defined at `into` or later means the merge, since a
-    /// use of it in `at` would be a forward reference.
-    pub fn close(&mut self, at: usize, into: usize) {
-        self.moved.insert(at, (into, self.insts.len() as u32));
-    }
-
-    /// `at` itself, or the merge of the split that closed it.
-    pub fn cont(&self, mut at: usize) -> usize {
-        while let Some(&(into, _)) = self.moved.get(&at) {
-            at = into;
-        }
-        at
-    }
-
-    /// Whether instruction `v` stands where `at` can read it: in `at` itself,
-    /// or emitted before `at` was split at `made` (every block an operand is
-    /// emitted into dominates `at` in practice — an instruction read through
-    /// a stale `at` reads what it was written with).
-    fn ready(&self, v: V, at: usize, made: u32) -> bool {
-        match v {
-            V::Inst(j) => {
-                self.inst_block[j as usize] == at as u32 || j < made
-            }
-            _ => true,
-        }
-    }
-
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
-        let mut at = block;
-        while let Some(&(into, made)) = self.moved.get(&at) {
-            let need_into = |v: V| !self.ready(v, at, made);
-            let into_it = match &op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) => need_into(*a) | need_into(*b),
-                Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => need_into(*v),
-                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
-                    need_into(*a) | need_into(*b) | need_into(*c)
-                }
-                Op::Store(a, b) | Op::AtomicRmw(_, a, b) => need_into(*a) | need_into(*b),
-                Op::Call(_, args) => args.iter().any(|&a| need_into(a)),
-                Op::Gep(_, v, ix) => need_into(*v) | ix.iter().any(|&a| need_into(a)),
-                Op::Phi(args) => args.iter().any(|&(a, _)| need_into(a)),
-                Op::Alloca(_, n) => need_into(*n),
-            };
-            if !into_it {
-                break;
-            }
-            at = into;
-        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
-        self.inst_block.push(at as u32);
         // Terminators are kept apart, so a block can still grow at its end.
-        self.blocks[at].body.push(i);
+        self.blocks[block].body.push(i);
         V::Inst(i)
     }
 
@@ -582,8 +455,6 @@ impl Module {
             ty,
             op: Op::Phi(Vec::new()),
         });
-        let block = self.cont(block);
-        self.inst_block.push(block as u32);
         self.blocks[block].phis.push(i);
         V::Inst(i)
     }
@@ -621,112 +492,11 @@ impl Module {
         self.extract(block, r, 0)
     }
 
-    /// Gives every loop header that has more than one back edge a single
-    /// latch: a block of its own that the back edges branch to and that
-    /// branches to the header, the header's phis taking what the back edges
-    /// brought through phis of the latch. Returns how many latches it made.
-    ///
-    /// The console's loops `continue` from several blocks, each of which
-    /// became a back edge of its own. DXC never emits that, and
-    /// vkd3d-proton's DXIL to SPIR-V conversion (dxil-spirv) keeps one back
-    /// edge per header: in a program with a lane shuffle, which makes it
-    /// work out dominators before it untangles such loops, the edges it
-    /// dropped made a cycle it followed without end (the title's ray-traced
-    /// shadow programs; dxil-spirv#376): a stack overflow at any stack
-    /// size, and no pipeline.
-    pub(crate) fn single_latches(&mut self) -> usize {
-        let n = self.blocks.len();
-        if n == 0 {
-            return 0;
-        }
-        // Back edges: to a block on the depth-first path from the entry.
-        const NEW: u8 = 0;
-        const ON_PATH: u8 = 1;
-        const DONE: u8 = 2;
-        let mut state = vec![NEW; n];
-        let mut latches: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut stack = vec![(0usize, 0usize)];
-        state[0] = ON_PATH;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match successors(self.blocks[b].term).get(k) {
-                Some(&s) if state[s] == NEW => {
-                    state[s] = ON_PATH;
-                    stack.push((s, 0));
-                }
-                Some(&s) if state[s] == ON_PATH => {
-                    if !latches[s].contains(&b) {
-                        latches[s].push(b);
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    state[b] = DONE;
-                    stack.pop();
-                }
-            }
-        }
-        let mut made = 0;
-        for (header, from) in latches.into_iter().enumerate() {
-            if from.len() < 2 {
-                continue;
-            }
-            let latch = self.new_block();
-            self.blocks[latch].term = Some(Term::Br(header));
-            for &b in &from {
-                let to = |t: usize| if t == header { latch } else { t };
-                self.blocks[b].term = match self.blocks[b].term {
-                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
-                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
-                    other => other,
-                };
-            }
-            for i in self.blocks[header].phis.clone() {
-                let Op::Phi(incoming) = &self.insts[i as usize].op else {
-                    continue;
-                };
-                let (back, mut rest): (Vec<_>, Vec<_>) =
-                    incoming.iter().copied().partition(|(_, b)| from.contains(b));
-                if back.is_empty() {
-                    continue;
-                }
-                let ty = self.insts[i as usize].ty;
-                let j = self.insts.len() as u32;
-                self.insts.push(Inst {
-                    ty,
-                    op: Op::Phi(back),
-                });
-                self.inst_block.push(latch as u32);
-                self.blocks[latch].phis.push(j);
-                if let Some(&tag) = self.tags.get(&i) {
-                    self.tags.insert(j, tag);
-                }
-                rest.push((V::Inst(j), latch));
-                self.insts[i as usize].op = Op::Phi(rest);
-            }
-            made += 1;
-        }
-        made
-    }
-
-    /// Memory of type `ty` private to each lane (`alloca`), for the entry block.
-    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
-        let (ptr, one) = (self.ptr(ty), self.i32(1));
-        self.push(block, ptr, Op::Alloca(ty, one))
-    }
-
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
-    /// The terminator `block` already has, if it was closed out.
-    pub fn term(&self, block: usize) -> Option<Term> {
-        self.blocks[block].term
-    }
-
     pub fn terminate(&mut self, block: usize, t: Term) {
-        let block = self.cont(block);
         self.blocks[block].term = Some(t);
     }
 
@@ -859,7 +629,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    g.align,
+                    3,
                     0,
                 ],
             );
@@ -957,7 +727,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1106,12 +876,6 @@ impl Module {
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
                     }
-                    // [type, size type, size (absolute id), alignment 4
-                    // (log2 + 1) | explicit type (bit 6)].
-                    Op::Alloca(ty, n) => {
-                        let (nt, n) = (self.type_of(*n).0, abs(*n));
-                        w.record(19, &[u64::from(ty.0), u64::from(nt), u64::from(n), 3 | 64]);
-                    }
                 }
                 if !self.is_void(inst.ty) {
                     inst_id += 1;
@@ -1161,8 +925,6 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*p);
             idx.iter().copied().for_each(f);
         }
-        // The size is a constant.
-        Op::Alloca(..) => {}
     }
 }
 
@@ -1434,62 +1196,43 @@ mod tests {
         assert_eq!(live, live_by_passes(&m));
     }
 
-    /// A loop whose header two blocks branch back to gets one latch: the
-    /// header has one back edge, its phi takes the latch's phi, and the
-    /// latch's phi has what each back edge brought.
     #[test]
-    fn a_loop_with_two_back_edges_gets_one_latch() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let i1 = m.int(1);
-        let [entry, head, left, right, exit] = [0; 5].map(|_| m.new_block());
-        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
-        m.terminate(entry, Term::Br(head));
-        let x = m.phi(head, i32t);
-        let c = m.cmp(head, pred::EQ, x, zero);
-        m.terminate(head, Term::CondBr(c, left, right));
-        let a = m.bin(left, Bin::Add, x, one);
-        let d = m.cmp(left, pred::EQ, a, two);
-        m.terminate(left, Term::CondBr(d, exit, head));
-        let b = m.bin(right, Bin::Add, x, two);
-        m.terminate(right, Term::Br(head));
-        m.set_phi(x, vec![(zero, entry), (a, left), (b, right)]);
-        m.terminate(exit, Term::Ret);
-        let _ = i1;
-
-        assert_eq!(m.single_latches(), 1);
-        let latch = m.blocks.len() - 1;
-        assert!(matches!(m.blocks[latch].term, Some(Term::Br(h)) if h == head));
-        assert!(matches!(m.blocks[left].term, Some(Term::CondBr(_, e, l)) if e == exit && l == latch));
-        assert!(matches!(m.blocks[right].term, Some(Term::Br(l)) if l == latch));
-        let V::Inst(xi) = x else { unreachable!() };
-        let Op::Phi(head_in) = &m.insts[xi as usize].op else { unreachable!() };
-        assert_eq!(head_in.len(), 2);
-        assert_eq!(head_in[0], (zero, entry));
-        let (latch_phi, from) = head_in[1];
-        assert_eq!(from, latch);
-        let V::Inst(li) = latch_phi else { unreachable!() };
-        let Op::Phi(latch_in) = &m.insts[li as usize].op else { unreachable!() };
-        assert_eq!(latch_in, &vec![(a, left), (b, right)]);
-        // Once is enough; and the module still writes.
-        assert_eq!(m.single_latches(), 0);
-        assert!(!m.write().is_empty());
-    }
-
-    /// One back edge, nested loops with one each, or none: left alone.
-    #[test]
-    fn loops_with_one_back_edge_are_left_alone() {
-        let mut m = Module::default();
-        let [entry, outer, inner, tail, exit] = [0; 5].map(|_| m.new_block());
-        let c = m.bool(true);
-        m.terminate(entry, Term::Br(outer));
-        m.terminate(outer, Term::Br(inner));
-        m.terminate(inner, Term::CondBr(c, inner, tail));
-        m.terminate(tail, Term::CondBr(c, outer, exit));
-        m.terminate(exit, Term::Ret);
-        let blocks = m.blocks.len();
-        assert_eq!(m.single_latches(), 0);
-        assert_eq!(m.blocks.len(), blocks);
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+                static FIRST: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+                FIRST[usize::from(*unordered)].call_once(|| tracing::warn!(
+                    unordered, dimension = resource[0], format = resource[8], flags = resource[12],
+                    address = format_args!("{:#x}", u64::from(desc[10]) | u64::from(desc[11]) << 32),
+                    "could not resolve the placed texture view"
+                ));
+                // Counted by kind: a shader view lands here only if no
+                // resource could be made at its address.
+                PLACED_NOT_MADE[usize::from(*unordered)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // shortcut: unordered access to a texture the title placed
+                // itself is not mirrored; give it a resource as shader
+                // views of such textures get when a dispatch writes one.
+                once!(
+                    dimension = resource[0],
+                    "placed unordered texture view not mirrored"
+                );

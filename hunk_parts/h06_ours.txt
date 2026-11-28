@@ -1,0 +1,6 @@
+    texture_sweep: Mutex<TextureSweep>,
+    pub(crate) material_demand: crate::material_demand::Mailbox,
+    // Allocated only while sampled material words are being observed. A slot may be
+    // rewritten and leave the upload queue before the GPU returns its selected index.
+    material_epochs: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    material_clock: std::sync::atomic::AtomicU64,

@@ -1,0 +1,3 @@
+            if shown != 0 {
+                self.quick_is(index, 0);
+                self.made.set(index, 0);

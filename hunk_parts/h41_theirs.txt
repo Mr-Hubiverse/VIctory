@@ -1,0 +1,8 @@
+        let kept = make_twinned(view, self.at(index), self.twin(index));
+        if kept.is_none() {
+            null_for(view, self.at(index));
+        }
+        self.put(index);
+        self.twin_made(index, kept.is_some() && twinned(view));
+        self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
+        self.keep(index, kept.flatten());

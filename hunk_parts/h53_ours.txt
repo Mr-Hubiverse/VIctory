@@ -1,0 +1,19 @@
+#[allow(dead_code)]
+/// Whether `[address, address + len)` may be title memory: inside the
+/// title's address range, not null.
+fn plausible(address: u64, len: u64) -> bool {
+    address >= 0x10000
+        && len > 0
+        && address
+            .checked_add(len)
+            .is_some_and(|end| end <= (1u64 << 48))
+}
+
+#[allow(dead_code)]
+/// Whether `[address, address + len)` is title memory: plausible, and in a
+/// title buffer or committed. The kernel is asked only outside buffers:
+/// in the title's big pools each asking costs milliseconds.
+fn valid_title_address(address: u64, len: u64) -> bool {
+    plausible(address, len)
+        && (crate::shadow::in_buffer(address, len)
+            || crate::texture::committed(address as *const u8, 1))

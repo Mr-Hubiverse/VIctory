@@ -1,0 +1,12 @@
+        // Search from `next` on, then from the start and on past `next` by
+        // n - 1 slots: a free run that lies across `next` is found only
+        // there (the first part sees its end, the second its start; upstream
+        // c1c32819e9). Without that such a table was refused with room for
+        // it, and `too_long` then refused every table as long until the
+        // next release.
+        let (cursor, end) = (*next as usize, taken.len());
+        let starts = (cursor..end).chain(0..(cursor + n - 1).min(end));
+        let mut run = 0;
+        let mut found = None;
+        let mut last = usize::MAX;
+        for (step, at) in starts.enumerate().take(if enough { usize::MAX } else { 0 }) {

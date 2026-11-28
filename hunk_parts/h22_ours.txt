@@ -1,0 +1,15 @@
+            if self.sampler {
+                null_sampler(start);
+            } else {
+                null_view(start);
+            }
+            let mut filled = 1;
+            while filled < BLOCK {
+                let n = filled.min(BLOCK - filled);
+                host.device
+                    .CopyDescriptorsSimple(n, at(filled), start, kind);
+                filled += n;
+            }
+            self.copy_nulls(host, start, kind, 0, total);
+            if !self.sampler {
+                self.null_views = Some(block);

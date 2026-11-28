@@ -1,0 +1,7 @@
+        let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
+        self.write_stride(index, stride.unwrap_or(0) | kind);
+        let was = if stride.is_some() {
+            self.buffers.put(index);
+            true
+        } else {
+            self.buffers.remove(index)

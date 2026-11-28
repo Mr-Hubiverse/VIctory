@@ -1,0 +1,4 @@
+        self.slots.insert(
+            index,
+            Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), recovered: false },
+        );

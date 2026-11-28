@@ -1,0 +1,106 @@
+    /// Up to `max` slots due at `frame`, each with its write number, in
+    /// the order to serve them:
+    /// - first the ones looked at before (their memory was not mapped, or
+    ///   only part of it): the look is a query, and memory that has
+    ///   arrived since is what the title streamed in last;
+    /// - then the others, the newest write first and the oldest next, in
+    ///   turns: slot order served the low slots of a backlog of
+    ///   25,000-40,000 while the textures of the shot on screen waited
+    ///   (run 52: 98% of the drawn pixels had no colour texture in the
+    ///   first 3D frames).
+    #[cfg(test)]
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let (due, _) = self.due_and_census(frame);
+        due.order(max)
+    }
+
+    /// [`TextureQueue::due`]'s slots, not in order yet, and
+    /// [`TextureQueue::census`], in one look at every slot: what the queue's
+    /// lock is held for. The order is made after it is let go
+    /// ([`Due::order`]). Ordered under the lock, the queue of some 40,000
+    /// slots in the first gameplay area kept it 1-5 ms a pass, and the
+    /// title's recording threads, whose every descriptor copy notes its slot
+    /// here, waited that long behind it (run timeline, 2026-11-26).
+    fn due_and_census(&self, frame: u64) -> (Due, [u64; 6]) {
+        let mut due = Due::default();
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            let again = w.checked.2 != 0;
+            if w.mapped > 0 {
+                c[3] += 1;
+            } else if again {
+                c[5] += 1;
+            } else if w.looks > 0 {
+                c[2] += 1;
+            }
+            if w.due <= frame {
+                c[1] += 1;
+                if !again {
+                    c[4] = c[4].max(frame.saturating_sub(w.written));
+                }
+                if w.looks > 0 || w.mapped > 0 {
+                    // (Only these can wait for a look again: `recheck`
+                    // leaves a look, `partly` some bytes mapped.)
+                    due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
+                } else {
+                    due.fresh.push((w.written, index, w.write));
+                }
+            }
+        }
+        (due, c)
+    }
+}
+
+/// What [`TextureQueue::recheck`] noted of a slot uploaded whole: where its
+/// memory is (address, bytes), its fingerprint, the looks that found it
+/// unchanged, the frame of the upload.
+pub(crate) type Checked = (u64, u64, u64, u8, u64);
+
+/// What the pass over textures picked by index found of a slot it took, as
+/// told to the queue ([`HostHeap::texture_slots_told`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Told {
+    /// Up to date ([`HostHeap::texture_slot_done`]): due again from frame
+    /// `.0` with `.1` bytes of its memory there, or not until written.
+    Done(Option<(u64, u64)>),
+    /// Uploaded whole, looked at again ([`HostHeap::texture_slot_recheck`]):
+    /// from frame, memory (address, bytes), fingerprint, looks, upload frame.
+    Recheck(u64, (u64, u64), u64, u8, u64),
+    /// Nothing to upload now ([`HostHeap::texture_slot_later`]): frame, most.
+    Later(u64, u64),
+    /// No room on the card ([`HostHeap::texture_slot_held`]): until frame.
+    Held(u64),
+}
+
+/// The slots due, taken from the queue ([`TextureQueue::due_and_census`]):
+/// (frame written, slot, write number) of those looked at before, with what
+/// [`TextureQueue::checked`] says of them, and of the others.
+#[derive(Default)]
+struct Due {
+    again: Vec<(u64, u32, u64, Option<Checked>)>,
+    fresh: Vec<(u64, u32, u64)>,
+}
+
+impl Due {
+    /// Up to `max` of them, in the order [`TextureQueue::due`] serves them.
+    #[cfg(test)]
+    fn order(self, max: usize) -> Vec<(u32, u64)> {
+        self.ordered(max).0
+    }
+
+    /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
+    /// each when they were taken.
+    fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
+        let Due { mut again, mut fresh } = self;
+        // By the number of the write, counted over the run.
+        again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
+        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && order.len() < max {
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old && order.len() < max {
+                old -= 1;
+                order.push((fresh[old].1, fresh[old].2));

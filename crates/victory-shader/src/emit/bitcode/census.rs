@@ -158,7 +158,6 @@ impl Module {
                     Op::Store(..) => k("lds_store"),
                     Op::AtomicRmw(..) | Op::CmpXchg(..) => k("atomic"),
                     Op::Call(f, _) => call_kind[*f as usize],
-                    Op::Alloca(..) => k("alloca"),
                 };
                 c.counts[at] += 1;
                 match self.tags.get(&i) {

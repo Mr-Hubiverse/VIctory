@@ -1,0 +1,12 @@
+    spans: std::collections::BTreeMap<(u64, u64), ([u32; 14], std::collections::BTreeSet<u32>)>,
+    by_slot: std::collections::HashMap<u32, (u64, u64)>,
+    /// The level each slot's view starts at ([`Spans::shows`]).
+    first: std::collections::HashMap<u32, u32>,
+    /// Materialized slots made null by a newer placed texture. Only the guest
+    /// record key survives invalidation; no host resource is kept alive.
+    displaced: std::collections::BTreeMap<u32, u64>,
+    displaced_next: u32,
+    /// The bytes a placed texture takes, by resource description and first
+    /// mip: worked out once for each (a title writes the views of a few
+    /// thousand descriptions, thousands of times a frame).
+    sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
